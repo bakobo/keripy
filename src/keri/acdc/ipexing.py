@@ -12,8 +12,8 @@ from hio.help import ogler
 
 from .. import Kinds
 from ..kering import Colds, Vrsn_2_0, sniff
-from ..core import (Counter, Codens, Diger, GenDex, Number, Serdery, Texter,
-                    exchange, messagize)
+from ..core import (Counter, Codens, Diger, GenDex, Number, Serdery, SerderACDC,
+                    Texter, exchange, messagize)
 from ..peer import cloneMessage
 
 logger = ogler.getLogger()
@@ -29,6 +29,9 @@ PreviousRoutes = {
     Ipex.admit: (Ipex.grant,),
     Ipex.spurn: (Ipex.apply, Ipex.offer, Ipex.agree),
 }
+
+# Top-level ACDC section labels that compact to a bare SAID or AGID string
+CompactableSections = ("s", "a", "A", "e", "r")
 
 def _streamSerder(stream):
     """Extract the message serder from a bare or nested artifact stream.
@@ -153,6 +156,64 @@ def _normalizeNestedStream(stream):
     return Counter.enclose(qb64=nested,
                            code=Codens.BodyWithAttachmentGroup,
                            version=Vrsn_2_0)
+
+
+def _isMostCompact(serder):
+    """Determine whether a v2 ACDC is already in its most compact form.
+
+    Parameters:
+        serder (SerderACDC): Top-level ACDC to inspect.
+
+    Returns:
+        bool: True when every compactable section field is a bare SAID or AGID
+            string, False when any section is still an expanded block.
+    """
+    for label in CompactableSections:
+        value = serder.sad.get(label)
+        if value and not isinstance(value, str):
+            return False
+
+    return True
+
+
+def _compactArtifact(acdc):
+    """Reduce an ACDC artifact to its most compact variant.
+
+    The most compact SAID algorithm makes the top-level said of an ACDC
+    invariant across degrees of compaction, so the compact variant carries the
+    same said as the expanded one and satisfies any said comparison that the
+    expanded one satisfies.
+
+    Compaction replaces each section block with its said, so an artifact stream
+    that carried the expanded body is not preserved. Any attachment bound to the
+    expanded body is dropped along with it, since it is bound to bytes that are
+    no longer disclosed.
+
+    Parameters:
+        acdc (Serder | bytes | bytearray): Credential artifact to compact.
+
+    Returns:
+        Serder | bytes | bytearray: Most compact variant of the artifact, or the
+            unmodified input when it is not a compactable v2 ACDC or is already
+            in most compact form.
+
+    Raises:
+        ValueError: If compaction changes the top-level said, which would mean
+            the artifact was not saidified by the most compact algorithm.
+    """
+    serder = _streamSerder(acdc)
+    if not isinstance(serder, SerderACDC) or serder.pvrsn.major < 2:
+        return acdc  # not a compactable v2 ACDC so leave it alone
+
+    if _isMostCompact(serder):
+        return acdc  # already most compact so pass the caller's stream through
+
+    compact = SerderACDC(sad=serder.sad, makify=True, compactify=True)
+    if compact.said != serder.said:
+        raise ValueError(f"Compaction changed artifact said from {serder.said} "
+                         f"to {compact.said}.")
+
+    return compact
 
 
 def _sign(hab, serder, *, nests=None, gvrsn=None):
@@ -391,7 +452,9 @@ def offer(hab, message, acdc, apply=None, recp=None, dt=None, kind=None, gvrsn=N
     Parameters:
         hab (Hab): Habitat creating and signing the exchange.
         message (str): Human-readable offer message.
-        acdc (Serder | bytes | bytearray): Offered credential artifact.
+        acdc (Serder | bytes | bytearray): Offered credential artifact. Reduced
+            to its most compact variant before nesting, so an expanded artifact
+            may be passed without disclosing its sections.
         apply (Serder | None): Optional prior ``apply`` exchange.
         recp (str | None): Optional recipient AID. Defaults to the prior
             ``apply`` sender; supply it directly for an offer-first exchange
@@ -404,6 +467,15 @@ def offer(hab, message, acdc, apply=None, recp=None, dt=None, kind=None, gvrsn=N
         tuple[Serder, bytearray]: Outer exchange serder and detached attachment
             bytes for the signed V2 stream.
     """
+    # An offer precedes agreement, so disclose the least the offer can carry.
+    # An expanded artifact puts its section blocks on the wire, and the edge
+    # section in particular names the said of every source ACDC. Those saids are
+    # stable across presentations, so a disclosee who then spurns keeps a durable
+    # correlator for the holder. The most compact variant has the same top-level
+    # said, so a["acdc"] is unchanged and IpexHandler.verify() still matches the
+    # nested artifact against it.
+    acdc = _compactArtifact(acdc)
+
     # Get the prior event (apply) and the party to address (its sender)
     prior = apply.said if apply is not None else ""
     receiver = recp if recp is not None else (apply.ked["i"] if apply is not None else "")

@@ -795,3 +795,92 @@ def test_ipex_v2_responders_set_receiver():
                                    offer=offerExn,
                                    recp=holder.pre)
         assert overrideExn.ked["ri"] == holder.pre
+
+
+def test_ipex_v2_offer_compacts_expanded_acdc():
+    """Prove an offer discloses only the most compact ACDC, hiding edge saids."""
+    with openHby(name="ipex-v2-offer-compact",
+                 base="test",
+                 version=Vrsn_2_0) as hby:
+
+        hab = hby.makeHab(name="test")
+        registry = regcept(israid=hab.pre)
+
+        # Source ACDC that the offered ACDC points at through its edge section
+        source = acdcmap(israid=hab.pre,
+                         regid=registry.said,
+                         attribute=dict(d="", LEI="254900OPPU84GM83MG36"))
+        sourceSchema = source.sad["s"]["$id"]
+
+        # Offered ACDC in expanded form with an edge naming the source said
+        acdc = acdcmap(israid=hab.pre,
+                       regid=registry.said,
+                       attribute=dict(d="", LEI="254900OPPU84GM83MG36"),
+                       iseaid=hab.pre,
+                       edge=dict(d="", boss=dict(d="", n=source.said,
+                                                 s=sourceSchema)))
+
+        # The expanded artifact puts the far node said on the wire
+        assert isinstance(acdc.sad["e"], dict)
+        assert acdc.sad["e"]["boss"]["n"] == source.said
+        assert source.saidb in acdc.raw
+
+        offerExn, offerAtc = ipexOffer(hab=hab,
+                                       message="Here is the offered credential",
+                                       acdc=acdc,
+                                       recp=hab.pre)
+
+        # The outer body still names the same acdc said
+        assert offerExn.ked["a"]["acdc"] == acdc.said
+
+        # Neither the body nor the attachments carry the far node said
+        stream = bytearray(offerExn.raw)
+        stream.extend(offerAtc)
+        assert source.saidb not in stream
+
+        # The nested artifact is still there, compacted, and still matches
+        offerIms = bytearray(stream)
+        offerResults = Parser(version=Vrsn_2_0).parse(ims=offerIms,
+                                                      framed=False,
+                                                      processive=False)
+        assert offerIms == bytearray()
+        assert len(offerResults) == 1
+        offerResult = offerResults[0]
+
+        assert [nest.serder.said for nest in offerResult.nests] == [acdc.said]
+        nserder = offerResult.nests[0].serder
+        assert isinstance(nserder.sad["e"], str)    # edge section compacted
+        assert isinstance(nserder.sad["a"], str)    # attribute section compacted
+        assert nserder.verify()
+        assert nserder.compare(acdc.said)
+
+        # And the handler accepts the offer, so the stored exn round trips
+        recorder = Recorder()
+        exc = Exchanger(hby=hby, handlers=[])
+        loadHandlers(hby=hby, exc=exc, notifier=recorder)
+
+        dispatchIms = bytearray(stream)
+        Parser(version=Vrsn_2_0).parse(ims=dispatchIms, framed=False, exc=exc)
+        assert dispatchIms == bytearray()
+
+        storedOffer = hby.db.exns.get(keys=(offerExn.said,))
+        assert storedOffer is not None
+        assert storedOffer.ked["a"]["acdc"] == acdc.said
+
+        # An already compact artifact passes through unchanged
+        compact = acdcmap(israid=hab.pre,
+                          regid=registry.said,
+                          attribute=dict(d="", LEI="254900OPPU84GM83MG36"),
+                          iseaid=hab.pre,
+                          edge=dict(d="", boss=dict(d="", n=source.said,
+                                                    s=sourceSchema)),
+                          compactify=True)
+        assert compact.said == acdc.said
+
+        compactExn, compactAtc = ipexOffer(hab=hab,
+                                           message="Here is the offered credential",
+                                           acdc=compact,
+                                           recp=hab.pre,
+                                           dt=offerExn.ked["dt"])
+        assert compactExn.said == offerExn.said
+        assert compactAtc == offerAtc
