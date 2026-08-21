@@ -77,7 +77,15 @@ setup(
                         'cbor2==6.1.3',
                         'multidict==6.7.0',
                         'ordered-set==4.1.0',
-                        'hio==0.7.19',
+                        # hio 0.7.19 leaks its mkdtemp root on every temp Filer whose path is a
+                        # directory: Filer._clearPath removes only the tail of .path, and the root
+                        # created by tempfile.mkdtemp is never stored on the instance. Every
+                        # Baser/Keeper/Configer/Reger/Mailboxer opened with temp=True therefore
+                        # strands an empty keri_*_test skeleton in /tmp for the life of the box.
+                        # Fixed upstream in ioflo/hio#162 (merged 2026-07-15) but unreleased —
+                        # PyPI is still at 0.7.19 — so the stack pins the bakobo fork at the merge
+                        # commit. Revert to a version constraint once hio 0.7.20 ships.
+                        'hio @ git+https://github.com/bakobo/hio@7b0350eab3115f42cd6be5dee2b203d052a320aa',
                         'multicommand==1.0.0',
                         'jsonschema==4.26.0',
                         'falcon==4.2.0',
