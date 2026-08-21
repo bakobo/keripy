@@ -4,24 +4,35 @@ keri.acdc.registring module
 
 Registry (TEL) event support
 
-Verification core and ingest shell for ACDC v2 state registries (TELs) made
-of 'rip' (registry inception), 'upd' (unblindable update), and 'bup'
-(blindable update) events.  The stateless core (vet and the vet* helpers)
-judges a supplied registry event chain against the issuer's KEL evidence and
-an optional disclosed blinded-state block; the ingest shell (Rever) processes
-registry event streams into a RegBaser with missing-anchor (.maes) and
-out-of-order (.ooes) escrows and drain methods.
+Party-side verification core and ingest shell for ACDC v2 blindable state
+registries (TELs) made of 'rip' (registry inception) and 'bup' (blindable
+update) events.  Given a supplied registry event chain, the issuer's KEL
+evidence, and optionally a disclosed blinded-state block, vet() and the vet*
+helpers determine the registry's verified state.  The core fetches nothing and
+concludes only from the evidence handed to it; KEL verification remains the
+caller's job.  Rever processes registry event streams into a RegBaser with
+missing-anchor (.maes) and out-of-order (.ooes) escrows and drain methods.
+
+This complements keri.acdc.registraring, which manages the registries a local
+habitat controls.  Where that module issues, this one judges: its evidence is
+another party's, its anchor search runs against that party's KEL, and its
+refusals are named so a caller can tell a permanent one from a retryable one.
+
+Bakobo fork note: vetRegistries and Rever are carried here ahead of upstream.
+Every vet* function is kept identical to what is proposed upstream so that this
+file collapses to a two-symbol delta if that proposal lands.
 """
 
-from collections import namedtuple
 from collections.abc import Mapping
+from collections import namedtuple
 
 from .. import help
 from ..kering import (Ilks, ValidationError, InvalidValueError,
                       MissingAnchorError, OutOfOrderError, MisdigestError,
                       MissequenceError, MisregistryError, MisanchorError,
-                      RootSealError, MisbindingError, DuplicitousRegistryError,
-                      ConflictingRegistriesError, UnverifiedBlindError)
+                      RootSealError, MisbindingError,
+                      DuplicitousRegistryError, ConflictingRegistriesError,
+                      UnverifiedBlindError)
 from ..core import (Blinder, BlindState, BoundState, Diger, Number, Saider,
                     SerderACDC)
 
@@ -38,7 +49,7 @@ Fields:
     issuer (str): qb64 AID of the registry's issuer (the rip's i field)
     said (str): qb64 SAID of the head (latest verified) registry event
     sn (int): sequence number of the head event
-    ilk (str): message type of the head event (rip, bup, or upd)
+    ilk (str): message type of the head event (rip or bup)
     acdc (str|None): qb64 SAID of the transaction ACDC the head state
         commits to; None when the registry has no update yet or the head is
         blinded and undisclosed
@@ -230,17 +241,16 @@ def vetRip(rip):
     return serder
 
 
-def vetUpdate(upd, rip):
-    """Validate a registry update (bup or upd) event's registry-level fields
-    against its registry inception.
+def vetUpdate(bup, rip):
+    """Validate a blindable registry update (bup) event's registry-level
+    fields against its registry inception.
 
     Returns:
-        serder (SerderACDC): the validated update event
+        serder (SerderACDC): the validated bup event
     """
-    serder = _coerce(upd)
-    if serder.ilk not in (Ilks.bup, Ilks.upd):
-        raise ValidationError(f"Expected registry update ilk in "
-                              f"({Ilks.bup}, {Ilks.upd}) got "
+    serder = _coerce(bup)
+    if serder.ilk != Ilks.bup:
+        raise ValidationError(f"Expected registry update ilk={Ilks.bup} got "
                               f"ilk={serder.ilk} for event {serder.said}.")
     if serder.sad['rd'] != rip.said:
         raise MisregistryError(f"Registry update {serder.said} has "
@@ -355,8 +365,7 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
 
     Parameters:
         rip (SerderACDC|bytes): registry inception event
-        updates (Iterable|None): registry update (bup/upd) events, in any
-            order; a mixed bup/upd history is one chain
+        updates (Iterable|None): registry update (bup) events, in any order
         db (Baser): KEL database the caller has already populated; KEL
             verification is the caller's job
         acdc (SerderACDC|bytes|None): optionally, the presented ACDC to
@@ -428,10 +437,7 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
 
     head = chain[-1]
     acdcsaid = state = None
-    if head.ilk == Ilks.upd:
-        acdcsaid = head.sad['td'] or None
-        state = head.sad['ts'] or None
-    elif head.ilk == Ilks.bup and blinder is not None:
+    if head.ilk == Ilks.bup and blinder is not None:
         disclosed, toldState = vetBlind(blinder=blinder, blid=head.sad['b'])
         acdcsaid = disclosed or None
         state = toldState or None
@@ -506,7 +512,7 @@ def vetRegistries(acdc, evidences, *, db, sources=None):
 
 class Rever:
     """Rever is a registry (TEL) event verifier and ingest node for ACDC v2
-    state registries.  It processes a stream of rip/bup/upd events into a
+    state registries.  It processes a stream of rip/bup events into a
     RegBaser: event bodies into .evts, verified KEL anchor couples into
     .ancs, and the acceptance commit markers .tels/.heads only after full
     verification -- chain rules and KEL anchor both.  Events whose KEL
@@ -537,7 +543,7 @@ class Rever:
         """Process one registry event: verify and accept, escrow, or refuse.
 
         Parameters:
-            serder (SerderACDC|bytes): registry event (rip, bup, or upd)
+            serder (SerderACDC|bytes): registry event (rip or bup)
 
         Raises:
             OutOfOrderError: event escrowed to .ooes awaiting its prior
@@ -549,7 +555,7 @@ class Rever:
         serder = _coerce(serder)
         if serder.ilk == Ilks.rip:
             self.processRip(serder)
-        elif serder.ilk in (Ilks.bup, Ilks.upd):
+        elif serder.ilk == Ilks.bup:
             self.processUpdate(serder)
         else:
             raise ValidationError(f"Unexpected ilk={serder.ilk} for registry "
@@ -571,7 +577,7 @@ class Rever:
         self.accept(serder, regid=regid, sn=0, couple=couple)
 
     def processUpdate(self, serder):
-        """Process a registry update (bup or upd) event."""
+        """Process a blindable registry update (bup) event."""
         n = Number(numh=serder.sad['n']).num
         if n < 1:
             raise MissequenceError(f"Registry update {serder.said} has "
