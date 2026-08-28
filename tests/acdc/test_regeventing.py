@@ -1,22 +1,25 @@
 # -*- encoding: utf-8 -*-
 """
-tests.acdc.test_registring module
+tests.acdc.test_regeventing module
 
-Tests for keri.acdc.registring: the ACDC v2 registry (TEL) verification core
-and the RegBaser ingest shell (Rever).
+Tests for keri.acdc.regeventing: the ACDC v2 registry (TEL) verification core.
 
 The verification core answers, for a party holding evidence: given a registry
-event chain (rip + upd/bup events), the issuer's KEL (a Baser the caller has
-already populated -- KEL verification is not registring's job), and optionally
+event chain (rip + bup events), the issuer's KEL (a Baser the caller has
+already populated -- KEL verification is not regeventing's job), and optionally
 a disclosed blinded-state block, what is the registry's verified state?
 
 All valid material is built with keripy's own builders (regcept, blindate,
-update, acdcmap) and real Habs (habbing) with anchors written through
-Hab.interact.  Adversarial cases are reached by mutating valid material,
-never by hand-rolling events.
+acdcmap) and real Habs (habbing) with anchors written through Hab.interact.
+Adversarial cases are reached by mutating valid material, never by hand-rolling
+events.
 
-The test names carry the row ids (V1..V24) of the approved test catalogue so
-the mapping from obligation to test is auditable.
+The test names carry the row ids (V1..V23) of the approved test catalogue so
+the mapping from obligation to test is auditable.  V17 (parallel-registry
+equivocation) and V24 (a chain mixing upd and bup events) are absent from this
+module: the first belongs with a multi-registry policy layer, and the second
+tests the 'upd' event, which is deprecated.  V16b is an added row covering an
+ACDC presented against a blinded head with no disclosure.
 """
 
 import inspect
@@ -28,13 +31,10 @@ from keri import kering
 from keri import Vrsn_2_0, Ilks
 from keri.core import Blinder, BlindState, Diger, SerderACDC
 from keri.core.signing import Salter
-from keri.acdc import regcept, blindate, update, acdcmap
-from keri.acdc import regeventing as registring
-from keri.acdc.regeventing import (RegStateRecord, Rever, vet, vetBlind,
-                                  vetRegistries)
-from keri.acdc.regbasing import RegBaser
+from keri.acdc import regcept, blindate, acdcmap
+from keri.acdc import regeventing
+from keri.acdc.regeventing import RegStateRecord, vet, vetBlind
 from keri.app import habbing
-from keri.db import openLMDB
 
 
 # Fixed stamps (all the same length so raw mutations preserve size).
@@ -81,6 +81,19 @@ def makeRegistry(hab, stamp=STAMP0, anchored=True):
     return ripper
 
 
+def makeUpdate(regid, prior, acdc, state, *, sn=1, stamp=None, salt=SALT):
+    """Build one blindable update: the issuer-side blinded state block and the
+    bup event that anchors its BLID.
+
+    Returns:
+        (blinder, bup) (tuple[Blinder, SerderACDC])
+    """
+    blinder = Blinder.blind(acdc=acdc, state=state, salt=salt, sn=sn)
+    bup = blindate(regid=regid, prior=prior, blid=blinder.said, sn=sn,
+                   stamp=stamp)
+    return blinder, bup
+
+
 def makeAcdc(hab, regid=None, name="Sunspot College"):
     """Create a real ACDC (acm) issued by hab, optionally bound to a registry
     through its rd field."""
@@ -107,22 +120,23 @@ def openIssuer(name):
 # Chain and fields
 # ---------------------------------------------------------------------------
 
-def test_V1_rip_upd_issued_verifies():
-    """V1: rip -> upd(issued), both anchored: verifies, state issued at n 1."""
+def test_V1_rip_bup_issued_verifies():
+    """V1: rip -> bup(issued), both anchored: verifies, state issued at n 1."""
     with openIssuer("v1") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        upd = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                     state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
+        anchor(hab, bup)
 
-        rec = vet(rip=ripper, updates=[upd], db=hby.db, acdc=acdc)
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc,
+                  blinder=blinder)
         assert isinstance(rec, RegStateRecord)
         assert rec.regid == ripper.said
         assert rec.issuer == hab.pre
-        assert rec.said == upd.said
+        assert rec.said == bup.said
         assert rec.sn == 1
-        assert rec.ilk == Ilks.upd
+        assert rec.ilk == Ilks.bup
         assert rec.acdc == acdc.said
         assert rec.state == 'issued'
         assert rec.binding == 'mutual'
@@ -131,27 +145,29 @@ def test_V1_rip_upd_issued_verifies():
             assert hby.db.kels.getLast(keys=hab.pre, on=kelsn) is not None
 
         # the core accepts raw streams as well as SerderACDC instances
-        rec2 = vet(rip=bytes(ripper.raw), updates=[bytes(upd.raw)], db=hby.db)
-        assert rec2.said == upd.said
+        rec2 = vet(rip=bytes(ripper.raw), updates=[bytes(bup.raw)],
+                   db=hby.db, blinder=blinder)
+        assert rec2.said == bup.said
         assert rec2.state == 'issued'
         assert rec2.binding is None  # no ACDC presented, no binding claimed
 
 
-def test_V2_revoking_upd_state_revoked():
-    """V2: V1 plus a revoking upd, anchored: state revoked at head n 2."""
+def test_V2_revoking_bup_state_revoked():
+    """V2: V1 plus a revoking bup, anchored: state revoked at head n 2."""
     with openIssuer("v2") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd1)
-        upd2 = update(regid=ripper.said, prior=upd1.said, acdc=acdc.said,
-                      state='revoked', sn=2, stamp=STAMP2)
-        anchor(hab, upd2)
+        blinder1, bup1 = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                    'issued', sn=1, stamp=STAMP1)
+        anchor(hab, bup1)
+        blinder2, bup2 = makeUpdate(ripper.said, bup1.said, acdc.said,
+                                    'revoked', sn=2, stamp=STAMP2)
+        anchor(hab, bup2)
 
-        rec = vet(rip=ripper, updates=[upd1, upd2], db=hby.db, acdc=acdc)
+        rec = vet(rip=ripper, updates=[bup1, bup2], db=hby.db, acdc=acdc,
+                  blinder=blinder2)
         assert rec.sn == 2
-        assert rec.said == upd2.said
+        assert rec.said == bup2.said
         assert rec.state == 'revoked'
         assert rec.acdc == acdc.said
 
@@ -172,8 +188,8 @@ def test_V4_n_gap_refused():
     with openIssuer("v4") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        gapped = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                        state='issued', sn=2, stamp=STAMP1)
+        _, gapped = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                               sn=2, stamp=STAMP1)
         anchor(hab, gapped)  # anchored, so the gap is the only defect
         with pytest.raises(kering.MissequenceError):
             vet(rip=ripper, updates=[gapped], db=hby.db)
@@ -184,8 +200,8 @@ def test_V5_p_mismatch_refused():
     with openIssuer("v5") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        crooked = update(regid=ripper.said, prior=acdc.said, acdc=acdc.said,
-                         state='issued', sn=1, stamp=STAMP1)
+        _, crooked = makeUpdate(ripper.said, acdc.said, acdc.said, 'issued',
+                                sn=1, stamp=STAMP1)
         anchor(hab, crooked)
         with pytest.raises(kering.MisdigestError):
             vet(rip=ripper, updates=[crooked], db=hby.db)
@@ -197,27 +213,24 @@ def test_V6_rd_mismatch_refused():
         ripper = makeRegistry(hab)
         other = makeRegistry(hab, stamp=STAMP2)
         acdc = makeAcdc(hab, regid=ripper.said)
-        stray = update(regid=other.said, prior=ripper.said, acdc=acdc.said,
-                       state='issued', sn=1, stamp=STAMP1)
+        _, stray = makeUpdate(other.said, ripper.said, acdc.said, 'issued',
+                              sn=1, stamp=STAMP1)
         anchor(hab, stray)
         with pytest.raises(kering.MisregistryError):
             vet(rip=ripper, updates=[stray], db=hby.db)
 
 
 def test_V7_field_order_and_said_mutations_refused():
-    """V7: field-order and SAID mutations across all three event types are
-    each refused by SerderACDC's own validation (one row standing for the
-    mutation battery)."""
+    """V7: field-order and SAID mutations across both event types are each
+    refused by SerderACDC's own validation (one row standing for the mutation
+    battery)."""
     with openIssuer("v7") as (hby, hab):
         ripper = makeRegistry(hab, anchored=False)
         acdc = makeAcdc(hab, regid=ripper.said)
-        upd = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                     state='issued', sn=1, stamp=STAMP1)
-        blinder = Blinder.blind(acdc=acdc.said, state='issued', salt=SALT, sn=1)
-        bup = blindate(regid=ripper.said, prior=ripper.said,
-                       blid=blinder.said, sn=1, stamp=STAMP1)
+        _, bup = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                            sn=1, stamp=STAMP1)
 
-        for serder in (ripper, upd, bup):
+        for serder in (ripper, bup):
             raw = bytes(serder.raw)
 
             # SAID mutation: tamper the embedded said
@@ -255,14 +268,14 @@ def test_V8_unanchored_update_retryable():
     with openIssuer("v8") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        upd = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                     state='issued', sn=1, stamp=STAMP1)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
         # deliberately not anchored
         with pytest.raises(kering.MissingAnchorError):
-            vet(rip=ripper, updates=[upd], db=hby.db)
+            vet(rip=ripper, updates=[bup], db=hby.db)
         # once the anchor arrives, the same evidence verifies (retryable)
-        anchor(hab, upd)
-        rec = vet(rip=ripper, updates=[upd], db=hby.db)
+        anchor(hab, bup)
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, blinder=blinder)
         assert rec.state == 'issued'
 
 
@@ -359,29 +372,30 @@ def test_V14_substitution_sibling_registry_refused():
         # registry RA: acdcA issued then revoked
         ripA = makeRegistry(hab, stamp=STAMP0)
         acdcA = makeAcdc(hab, regid=ripA.said, name="Sunspot College")
-        updA1 = update(regid=ripA.said, prior=ripA.said, acdc=acdcA.said,
-                       state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, updA1)
-        updA2 = update(regid=ripA.said, prior=updA1.said, acdc=acdcA.said,
-                       state='revoked', sn=2, stamp=STAMP2)
-        anchor(hab, updA2)
+        _, bupA1 = makeUpdate(ripA.said, ripA.said, acdcA.said, 'issued',
+                              sn=1, stamp=STAMP1)
+        anchor(hab, bupA1)
+        blindA2, bupA2 = makeUpdate(ripA.said, bupA1.said, acdcA.said,
+                                    'revoked', sn=2, stamp=STAMP2)
+        anchor(hab, bupA2)
 
         # sibling registry RB: acdcB genuinely issued
         ripB = makeRegistry(hab, stamp=STAMP1)
         acdcB = makeAcdc(hab, regid=ripB.said, name="Moonspot College")
-        updB1 = update(regid=ripB.said, prior=ripB.said, acdc=acdcB.said,
-                       state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, updB1)
+        blindB1, bupB1 = makeUpdate(ripB.said, ripB.said, acdcB.said,
+                                    'issued', sn=1, stamp=STAMP1)
+        anchor(hab, bupB1)
 
         # both registries verify on their own evidence
-        assert vet(rip=ripA, updates=[updA1, updA2], db=hby.db,
-                   acdc=acdcA).state == 'revoked'
-        assert vet(rip=ripB, updates=[updB1], db=hby.db,
-                   acdc=acdcB).state == 'issued'
+        assert vet(rip=ripA, updates=[bupA1, bupA2], db=hby.db, acdc=acdcA,
+                   blinder=blindA2).state == 'revoked'
+        assert vet(rip=ripB, updates=[bupB1], db=hby.db, acdc=acdcB,
+                   blinder=blindB1).state == 'issued'
 
         # the substitution: revoked acdcA riding RB's issued chain
         with pytest.raises(kering.MisbindingError) as ex:
-            vet(rip=ripB, updates=[updB1], db=hby.db, acdc=acdcA)
+            vet(rip=ripB, updates=[bupB1], db=hby.db, acdc=acdcA,
+                blinder=blindB1)
         assert 'td' in str(ex.value)
 
 
@@ -394,12 +408,13 @@ def test_V15_acdc_rd_mismatch_refused():
 
         ripB = makeRegistry(hab, stamp=STAMP1)
         # RB's update genuinely commits td = acdcA -- but acdcA names RA
-        updB1 = update(regid=ripB.said, prior=ripB.said, acdc=acdcA.said,
-                       state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, updB1)
+        blindB1, bupB1 = makeUpdate(ripB.said, ripB.said, acdcA.said,
+                                    'issued', sn=1, stamp=STAMP1)
+        anchor(hab, bupB1)
 
         with pytest.raises(kering.MisbindingError) as ex:
-            vet(rip=ripB, updates=[updB1], db=hby.db, acdc=acdcA)
+            vet(rip=ripB, updates=[bupB1], db=hby.db, acdc=acdcA,
+                blinder=blindB1)
         assert 'rd' in str(ex.value)
 
 
@@ -410,42 +425,28 @@ def test_V16_rdless_acdc_oneway_binding():
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=None)  # correlation-minimized: no rd
         assert 'rd' not in acdc.sad
-        upd = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                     state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
+        anchor(hab, bup)
 
-        rec = vet(rip=ripper, updates=[upd], db=hby.db, acdc=acdc)
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc,
+                  blinder=blinder)
         assert rec.state == 'issued'
         assert rec.binding == 'oneway'  # nothing commits ACDC->registry
 
 
-def test_V17_parallel_registries_conflict_refused():
-    """V17: evidence containing two registries by one issuer, both committing
-    td = the same ACDC with disagreeing states, is refused as a conflict --
-    parallel-registry equivocation is duplicity one level up."""
-    with openIssuer("v17") as (hby, hab):
-        acdcX = makeAcdc(hab, regid=None)
+def test_V16b_blinded_head_undisclosed_binds_nothing():
+    """V16b: an ACDC presented against a blinded head with no disclosure is
+    refused: the chain verifies, but nothing binds the ACDC to it."""
+    with openIssuer("v16b") as (hby, hab):
+        ripper = makeRegistry(hab)
+        acdc = makeAcdc(hab, regid=ripper.said)
+        _, bup = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                            sn=1, stamp=STAMP1)
+        anchor(hab, bup)
 
-        ripA = makeRegistry(hab, stamp=STAMP0)
-        updA = update(regid=ripA.said, prior=ripA.said, acdc=acdcX.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, updA)
-
-        ripB = makeRegistry(hab, stamp=STAMP1)
-        updB = update(regid=ripB.said, prior=ripB.said, acdc=acdcX.said,
-                      state='revoked', sn=1, stamp=STAMP2)
-        anchor(hab, updB)
-
-        evidences = [(ripA, [updA]), (ripB, [updB])]
-        for order in (evidences, list(reversed(evidences))):
-            with pytest.raises(kering.ConflictingRegistriesError):
-                vetRegistries(acdc=acdcX, evidences=order, db=hby.db)
-
-        # a single registry committing the ACDC passes through vetRegistries
-        recs = vetRegistries(acdc=acdcX, evidences=[(ripA, [updA])], db=hby.db)
-        assert len(recs) == 1
-        assert recs[0].state == 'issued'
-        assert recs[0].binding == 'oneway'
+        with pytest.raises(kering.UnverifiedBlindError):
+            vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc)
 
 
 # ---------------------------------------------------------------------------
@@ -458,10 +459,10 @@ def test_V18_equal_n_duplicity_both_orders():
     with openIssuer("v18") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        forkA = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                       state='issued', sn=1, stamp=STAMP1)
-        forkB = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                       state='revoked', sn=1, stamp=STAMP2)
+        _, forkA = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                              sn=1, stamp=STAMP1)
+        _, forkB = makeUpdate(ripper.said, ripper.said, acdc.said, 'revoked',
+                              sn=1, stamp=STAMP2)
         anchor(hab, forkA)
         anchor(hab, forkB)
 
@@ -476,19 +477,20 @@ def test_V19_later_event_wins():
     with openIssuer("v19") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd1)
-        upd2 = update(regid=ripper.said, prior=upd1.said, acdc=acdc.said,
-                      state='revoked', sn=2, stamp=STAMP2)
-        anchor(hab, upd2)
+        _, bup1 = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                             sn=1, stamp=STAMP1)
+        anchor(hab, bup1)
+        blinder2, bup2 = makeUpdate(ripper.said, bup1.said, acdc.said,
+                                    'revoked', sn=2, stamp=STAMP2)
+        anchor(hab, bup2)
 
-        # the presenter would rely on upd1 (issued); the evidence knows better,
+        # the presenter would rely on bup1 (issued); the evidence knows better,
         # in whatever order the events arrive
-        for updates in ([upd1, upd2], [upd2, upd1]):
-            rec = vet(rip=ripper, updates=updates, db=hby.db, acdc=acdc)
+        for updates in ([bup1, bup2], [bup2, bup1]):
+            rec = vet(rip=ripper, updates=updates, db=hby.db, acdc=acdc,
+                      blinder=blinder2)
             assert rec.sn == 2
-            assert rec.said == upd2.said
+            assert rec.said == bup2.said
             assert rec.state == 'revoked'
 
 
@@ -502,9 +504,8 @@ def test_V20_bup_disclosed_blind_verifies():
     with openIssuer("v20") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        blinder = Blinder.blind(acdc=acdc.said, state='issued', salt=SALT, sn=1)
-        bup = blindate(regid=ripper.said, prior=ripper.said,
-                       blid=blinder.said, sn=1, stamp=STAMP1)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
         anchor(hab, bup)
 
         rec = vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc,
@@ -535,9 +536,8 @@ def test_V21_blind_not_reproducing_refused():
     with openIssuer("v21") as (hby, hab):
         ripper = makeRegistry(hab)
         acdc = makeAcdc(hab, regid=ripper.said)
-        blinder = Blinder.blind(acdc=acdc.said, state='issued', salt=SALT, sn=1)
-        bup = blindate(regid=ripper.said, prior=ripper.said,
-                       blid=blinder.said, sn=1, stamp=STAMP1)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
         anchor(hab, bup)
 
         # same salt and sn, wrong state: the recomputed BLID differs
@@ -578,8 +578,8 @@ def test_V23_no_salt_parameter_anywhere():
     """V23: the verify path's API surface -- no parameter anywhere accepts a
     salt.  The salt's absence from every signature is itself the row."""
     checked = 0
-    for name, obj in inspect.getmembers(registring):
-        if getattr(obj, "__module__", None) != registring.__name__:
+    for name, obj in inspect.getmembers(regeventing):
+        if getattr(obj, "__module__", None) != regeventing.__name__:
             continue
         if inspect.isfunction(obj):
             assert 'salt' not in inspect.signature(obj).parameters, name
@@ -592,193 +592,9 @@ def test_V23_no_salt_parameter_anywhere():
     assert checked > 0  # the sweep saw a real API surface
 
 
-def test_V24_mixed_upd_bup_chain():
-    """V24: a registry mixing upd and bup events verifies; the mixed history
-    is one chain, not two."""
-    with openIssuer("v24") as (hby, hab):
-        ripper = makeRegistry(hab)
-        acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd1)
-        blinder = Blinder.blind(acdc=acdc.said, state='issued', salt=SALT, sn=2)
-        bup2 = blindate(regid=ripper.said, prior=upd1.said,
-                        blid=blinder.said, sn=2, stamp=STAMP2)
-        anchor(hab, bup2)
-        upd3 = update(regid=ripper.said, prior=bup2.said, acdc=acdc.said,
-                      state='revoked', sn=3, stamp=STAMP3)
-        anchor(hab, upd3)
-
-        # blinded head mid-chain: one chain through both event kinds
-        rec = vet(rip=ripper, updates=[upd1, bup2], db=hby.db, blinder=blinder)
-        assert rec.sn == 2
-        assert rec.ilk == Ilks.bup
-        assert rec.state == 'issued'
-
-        # and through to a clear head past the blinded link
-        rec2 = vet(rip=ripper, updates=[upd1, bup2, upd3], db=hby.db,
-                   acdc=acdc)
-        assert rec2.sn == 3
-        assert rec2.ilk == Ilks.upd
-        assert rec2.state == 'revoked'
-
-
-# ---------------------------------------------------------------------------
-# The ingest shell: Rever over RegBaser
-# ---------------------------------------------------------------------------
-
-def test_rever_ingest_and_acceptance():
-    """The ingest node writes evts/ancs and commits tels/heads acceptance
-    markers only after full verification."""
-    with openIssuer("shell1") as (hby, hab), \
-            openLMDB(cls=RegBaser, name="shell1", temp=True) as reger:
-        rever = Rever(reger=reger, db=hby.db)
-        ripper = makeRegistry(hab)
-        acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd1)
-        regid = ripper.said
-
-        rever.processEvent(ripper)
-        assert reger.evts.get(keys=ripper.said).said == ripper.said
-        number, diger = reger.ancs.get(keys=ripper.said)
-        assert hby.db.kels.getLast(keys=hab.pre, on=number.num) is not None
-        assert reger.tels.get(keys=regid, on=0).qb64 == ripper.said
-        assert reger.heads.get(keys=regid).qb64 == ripper.said
-
-        rever.processEvent(upd1)
-        assert reger.tels.get(keys=regid, on=1).qb64 == upd1.said
-        assert reger.heads.get(keys=regid).qb64 == upd1.said
-        assert reger.maes.cntAll() == 0
-        assert reger.ooes.cntAll() == 0
-
-        # reprocessing accepted events is idempotent
-        rever.processEvent(ripper)
-        rever.processEvent(upd1)
-        assert reger.heads.get(keys=regid).qb64 == upd1.said
-
-
-def test_rever_missing_anchor_escrow_and_drain():
-    """An event whose KEL anchor is missing lands in maes (no acceptance
-    marker); the drain accepts it once the anchor appears."""
-    with openIssuer("shell2") as (hby, hab), \
-            openLMDB(cls=RegBaser, name="shell2", temp=True) as reger:
-        rever = Rever(reger=reger, db=hby.db)
-        ripper = makeRegistry(hab)
-        acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        regid = ripper.said
-        rever.processEvent(ripper)
-
-        with pytest.raises(kering.MissingAnchorError):
-            rever.processEvent(upd1)  # not yet anchored
-        assert reger.evts.get(keys=upd1.said) is not None  # body retained
-        assert reger.tels.get(keys=regid, on=1) is None  # but not accepted
-        assert reger.heads.get(keys=regid).qb64 == ripper.said
-        assert reger.maes.cnt(keys=regid, on=1) == 1
-
-        rever.processEscrowMissingAnchors()  # nothing new: stays escrowed
-        assert reger.maes.cnt(keys=regid, on=1) == 1
-
-        anchor(hab, upd1)  # new KEL material arrives
-        rever.processEscrowMissingAnchors()
-        assert reger.tels.get(keys=regid, on=1).qb64 == upd1.said
-        assert reger.heads.get(keys=regid).qb64 == upd1.said
-        assert reger.maes.cntAll() == 0
-
-
-def test_rever_out_of_order_escrow_and_drain():
-    """An event arriving before its prior lands in ooes; the drain accepts it
-    once the prior is accepted."""
-    with openIssuer("shell3") as (hby, hab), \
-            openLMDB(cls=RegBaser, name="shell3", temp=True) as reger:
-        rever = Rever(reger=reger, db=hby.db)
-        ripper = makeRegistry(hab)
-        acdc = makeAcdc(hab, regid=ripper.said)
-        upd1 = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(hab, upd1)
-        upd2 = update(regid=ripper.said, prior=upd1.said, acdc=acdc.said,
-                      state='revoked', sn=2, stamp=STAMP2)
-        anchor(hab, upd2)
-        regid = ripper.said
-
-        # update before its registry inception
-        with pytest.raises(kering.OutOfOrderError):
-            rever.processEvent(upd1)
-        assert reger.ooes.cnt(keys=regid, on=1) == 1
-
-        rever.processEvent(ripper)
-
-        # update beyond head + 1: out of order on a stream, not a refusal
-        # (the party-side core refuses the same shape as a gap, V4)
-        with pytest.raises(kering.OutOfOrderError):
-            rever.processEvent(upd2)
-        assert reger.ooes.cnt(keys=regid, on=2) == 1
-
-        rever.processEscrowOutOfOrders()
-        assert reger.tels.get(keys=regid, on=1).qb64 == upd1.said
-        assert reger.tels.get(keys=regid, on=2).qb64 == upd2.said
-        assert reger.heads.get(keys=regid).qb64 == upd2.said
-        assert reger.ooes.cntAll() == 0
-
-
-def test_rever_refusals():
-    """Refusals are named and leave no acceptance markers: stranger-KEL
-    anchors, malformed rips, broken prior digests, equal-n duplicity."""
-    with habbing.openHby(name="shell4", temp=True, version=Vrsn_2_0) as hby, \
-            openLMDB(cls=RegBaser, name="shell4", temp=True) as reger:
-        issuer = hby.makeHab(name="issuer", version=Vrsn_2_0)
-        stranger = hby.makeHab(name="stranger", version=Vrsn_2_0)
-        rever = Rever(reger=reger, db=hby.db)
-
-        # a rip whose n is not "0"
-        crooked = remake(regcept(israid=issuer.pre, stamp=STAMP0), n='1')
-        anchor(issuer, crooked)
-        with pytest.raises(kering.MissequenceError):
-            rever.processEvent(crooked)
-        assert reger.tels.get(keys=crooked.said, on=1) is None
-
-        # a rip anchored only in a stranger's KEL
-        endorsed = regcept(israid=issuer.pre, stamp=STAMP1)
-        anchor(stranger, endorsed)
-        with pytest.raises(kering.MisanchorError):
-            rever.processEvent(endorsed)
-        assert reger.tels.get(keys=endorsed.said, on=0) is None
-        assert reger.heads.get(keys=endorsed.said) is None
-
-        # a healthy registry to break updates against
-        ripper = makeRegistry(issuer)
-        acdc = makeAcdc(issuer, regid=ripper.said)
-        regid = ripper.said
-        rever.processEvent(ripper)
-        upd1 = update(regid=regid, prior=ripper.said, acdc=acdc.said,
-                      state='issued', sn=1, stamp=STAMP1)
-        anchor(issuer, upd1)
-        rever.processEvent(upd1)
-
-        # an update at head + 1 whose p does not match the head
-        crooked = update(regid=regid, prior=acdc.said, acdc=acdc.said,
-                         state='revoked', sn=2, stamp=STAMP2)
-        anchor(issuer, crooked)
-        with pytest.raises(kering.MisdigestError):
-            rever.processEvent(crooked)
-        assert reger.tels.get(keys=regid, on=2) is None
-
-        # an anchored second event at an already-accepted n: duplicity
-        fork = update(regid=regid, prior=ripper.said, acdc=acdc.said,
-                      state='revoked', sn=1, stamp=STAMP3)
-        anchor(issuer, fork)
-        with pytest.raises(kering.DuplicitousRegistryError):
-            rever.processEvent(fork)
-        assert reger.tels.get(keys=regid, on=1).qb64 == upd1.said  # unmoved
-
-
 if __name__ == "__main__":
-    test_V1_rip_upd_issued_verifies()
-    test_V2_revoking_upd_state_revoked()
+    test_V1_rip_bup_issued_verifies()
+    test_V2_revoking_bup_state_revoked()
     test_V3_rip_n_nonzero_refused()
     test_V4_n_gap_refused()
     test_V5_p_mismatch_refused()
@@ -793,15 +609,10 @@ if __name__ == "__main__":
     test_V14_substitution_sibling_registry_refused()
     test_V15_acdc_rd_mismatch_refused()
     test_V16_rdless_acdc_oneway_binding()
-    test_V17_parallel_registries_conflict_refused()
+    test_V16b_blinded_head_undisclosed_binds_nothing()
     test_V18_equal_n_duplicity_both_orders()
     test_V19_later_event_wins()
     test_V20_bup_disclosed_blind_verifies()
     test_V21_blind_not_reproducing_refused()
     test_V22_spec_blid_vectors()
     test_V23_no_salt_parameter_anywhere()
-    test_V24_mixed_upd_bup_chain()
-    test_rever_ingest_and_acceptance()
-    test_rever_missing_anchor_escrow_and_drain()
-    test_rever_out_of_order_escrow_and_drain()
-    test_rever_refusals()
