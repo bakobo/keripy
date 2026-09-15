@@ -883,9 +883,17 @@ class Parser:
                         # flushed the stream and exts is unbound, so anything
                         # raised here is an artifact of that, not a new fault
                         _fault(faults, ex, Disps.resume, serder=serder)
-                finally:
-                    result = True
-                    break
+
+                # Not a finally block. These two statements are unconditional work that
+                # follows the try, not cleanup: the except above already catches every
+                # Exception, so the Exception and success paths both reach here either way.
+                # In a finally, the break silently discards anything still propagating --
+                # which for a BaseException that except Exception does not catch
+                # (KeyboardInterrupt, SystemExit, asyncio.CancelledError) meant an
+                # interrupted parse returned result=True and reported success. Python 3.14
+                # warns on this (PEP 765) and a later version makes it an error.
+                result = True
+                break
             else:
                 result = exts
                 break
