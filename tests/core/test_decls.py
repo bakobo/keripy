@@ -182,3 +182,52 @@ def test_a_declaration_travels_over_oobi_to_a_third_party():
         valhab.psr.parse(bytearray(stream))
 
         assert valhby.db.decls.get(keys=(withab.pre, "tags")).tags == ["testnet"]
+
+
+def test_a_declaration_travels_over_the_declarer_s_own_oobi():
+    """The door a consumer actually knocks on when it wants to know about the witness itself.
+
+    A controller designating a witness learns it by resolving the witness's own OOBI --
+    /oobi/<eid>/controller -- because that is the only address it has for it. Without this the
+    declaration reaches only a third party resolving somebody the witness witnesses, so the
+    party choosing whether to designate a laboratory witness is the one party who cannot see
+    that it is one.
+    """
+    salt = Salter(raw=b'abcdef0123456789').qb64
+    with openHby(name="wit", base="test", salt=salt, version=Vrsn_1_0) as withby, \
+            openHby(name="val", base="test", salt=salt, version=Vrsn_1_0) as valhby:
+        withab, valhab = _witness_and_validator(withby, valhby)
+        withab.psr.parse(_decl(withab, tags=["testnet"]))
+
+        stream = withab.replyToOobi(aid=withab.pre, role="controller", version=Vrsn_1_0,
+                                    kind=Kinds.json, gvrsn=Vrsn_1_0)
+        assert b"/decl/tags" in bytes(stream)
+
+        valhab.psr.parse(bytearray(stream))
+        assert valhby.db.decls.get(keys=(withab.pre, "tags")).tags == ["testnet"]
+
+
+def test_a_relay_replays_a_declaration_on_the_declarer_s_own_oobi():
+    """A party that holds somebody else's declaration passes it on with its own signature intact.
+
+    The same split replyEndRole already makes for loc scheme: the declarer re-signs, and anybody
+    else replays what they were given, so a declaration crossing a third party is still the
+    declarer's own signed statement rather than a repetition of it.
+    """
+    salt = Salter(raw=b'abcdef0123456789').qb64
+    with openHby(name="wit", base="test", salt=salt, version=Vrsn_1_0) as withby, \
+            openHby(name="rly", base="test", salt=salt, version=Vrsn_1_0) as rlyhby, \
+            openHby(name="val", base="test", salt=salt, version=Vrsn_1_0) as valhby:
+        withab, rlyhab = _witness_and_validator(withby, rlyhby)
+        rlyhab.psr.parse(_decl(withab, tags=["testnet"]))
+
+        stream = rlyhab.replyToOobi(aid=withab.pre, role="controller", version=Vrsn_1_0,
+                                    kind=Kinds.json, gvrsn=Vrsn_1_0)
+        assert b"/decl/tags" in bytes(stream)
+
+        valhab = valhby.makeHab(
+            name="val", isith="1", icount=1, transferable=True, version=Vrsn_1_0, kind=Kinds.json
+        )
+        valhab.psr.parse(bytearray(withab.msgOwnInception(framed=True, gvrsn=Vrsn_1_0)))
+        valhab.psr.parse(bytearray(stream))
+        assert valhby.db.decls.get(keys=(withab.pre, "tags")).tags == ["testnet"]
