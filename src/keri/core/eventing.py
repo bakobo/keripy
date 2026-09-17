@@ -3398,17 +3398,24 @@ class Kever:
             if bossn.said == bosso.said: # same delegating event
                 nseals = [SealEvent(**seal) for seal in bossn.seals
                                   if tuple(seal) == SealEvent._fields]
-                nindex = nseals.index(SealEvent(i=serfn.pre,
-                                                s=serfn.snh,
-                                                d=serfn.said))
+                nseal = SealEvent(i=serfn.pre, s=serfn.snh, d=serfn.said)
                 oseals = [SealEvent(**seal) for seal in bosso.seals
                                       if tuple(seal) == SealEvent._fields]
-                oindex = oseals.index(SealEvent(i=serfo.pre,
-                                                s=serfo.snh,
-                                                d=serfo.said))
+                oseal = SealEvent(i=serfo.pre, s=serfo.snh, d=serfo.said)
+                # Guard the seal lookups so a crafted delegating event that
+                # lacks the expected delegation seal raises a keri ValidationError
+                # instead of a raw ValueError from list.index().
+                if nseal not in nseals or oseal not in oseals:
+                    msg = (f"Missing delegation seal in delegating event "
+                           f"{bossn.said} for evt {serder.sn} {serder.ilk} "
+                           f"{serder.said}")
+                    logger.info(msg)
+                    logger.debug("Event Body=\n%s\n", serder.pretty())
+                    raise ValidationError(msg)
+                nindex = nseals.index(nseal)
+                oindex = oseals.index(oseal)
 
                 if nindex > oindex:  # superseding delegation seal is later
-                    # assumes index can't be None
                     # valid superseding delegation up chain so tail link valid
                     return (delsner, delsger)  # tail event's delegation source
 
