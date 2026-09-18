@@ -2566,15 +2566,37 @@ class Reger(LMDBer):
         return coreMessagize(serder, wigers=tibs or None, bonds=seal,
                              framed=False, gvrsn=gvrsn)
 
-    def sources(self, db, creder):
+    MaxSourceDepth = 100  # backstop cap on credential edge-chain recursion depth
+
+    def sources(self, db, creder, *, _visited=None, _depth=0):
         """ Returns raw bytes of any source ('e') credential that is in our database
 
         Parameters:
             db (LMDBer): table to search
             creder (Creder): root credential
+            _visited (set): internal walk-global set of SAIDs already fetched on
+                this walk, keyed by SAID. A source reached by multiple edges is
+                fetched and returned once, and a cyclic edge chain terminates.
+                Not part of the public interface.
+            _depth (int): internal recursion depth, capped at MaxSourceDepth as a
+                backstop. Not part of the public interface.
 
         Returns:
             list: credential sources as resolved from `e` in creder.crd"""
+        # Dedup across the whole walk keyed by SAID (as IpexHandler._walkGraph's
+        # `seen` does), so a source reachable by many edges is fetched once and a
+        # cyclic chain terminates. A path-scoped set instead permits exponential
+        # re-expansion -- a shallow acyclic DAG whose nodes each carry several
+        # edges to a shared child fans out to fetch counts that hang the Doist.
+        # The depth cap is only a backstop against a pathological
+        # linear chain, and raises rather than silently truncating.
+        if _visited is None:
+            _visited = set()
+        if _depth > self.MaxSourceDepth:
+            raise ValidationError(f"Credential edge chain deeper than "
+                                  f"{self.MaxSourceDepth} at {creder.said}")
+        _visited.add(creder.said)
+
         chains = creder.edge if creder.edge is not None else {}
         saids = []
         for key, source in chains.items():
@@ -2588,6 +2610,10 @@ class Reger(LMDBer):
 
         sources = []
         for said in saids:
+            if said in _visited:
+                continue
+            _visited.add(said)
+
             screder, prefixer, number, saider = self.cloneCred(said=said)
 
             msg = coreMessagize(screder,
@@ -2596,7 +2622,8 @@ class Reger(LMDBer):
             atc = bytearray(msg[screder.size:])
 
             sources.append((screder, atc))
-            sources.extend(self.sources(db, screder))
+            sources.extend(self.sources(db, screder,
+                                        _visited=_visited, _depth=_depth + 1))
 
         return sources
 
