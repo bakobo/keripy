@@ -300,6 +300,51 @@ def readBoundedBody(req, limit=MAX_CESR_BODY_SIZE):
     return raw
 
 
+#: Maximum size in bytes of an HTTP response body keripy will copy/parse from a
+#: (possibly malicious designated) peer. Like the request cap this is a PARTIAL
+#: mitigation: hio's client buffers the whole response before this runs, so it
+#: does NOT close the client-side OOM — that needs an hio streaming
+#: response cap. It removes the copy/parse amplification and never raises into a
+#: caller's doer.
+MAX_RESPONSE_SIZE = 32 * 1024 * 1024
+
+
+def boundedResponseBody(rep):
+    """Return the response body as bytes if within MAX_RESPONSE_SIZE, else None.
+
+    NEVER raises into the caller (the prior implementation raised ValidationError
+    into the Receiptor.receipt/get generators with no handler, crashing the
+    Doist). hio has already buffered the response,
+    so this only bounds what keripy copies and hands to the parser; over-cap it
+    logs and returns None so the caller drops the response instead of parsing an
+    unbounded body. The response itself is bounded by hio's streaming cap.
+
+    Parameters:
+        rep: hio HTTP response object exposing ``.body`` and optionally
+            ``.headers``.
+
+    Returns:
+        bytes | None: the body, or None if it exceeds the cap.
+    """
+    headers = getattr(rep, "headers", None) or {}
+    clen = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if clen is not None:
+        try:
+            if int(clen) > MAX_RESPONSE_SIZE:
+                logger.error(f"dropping over-cap response: Content-Length {clen} "
+                             f"exceeds {MAX_RESPONSE_SIZE} bytes")
+                return None
+        except (TypeError, ValueError):
+            pass  # unparseable header, fall through to the body-length check
+
+    body = getattr(rep, "body", None) or b""
+    if len(body) > MAX_RESPONSE_SIZE:
+        logger.error(f"dropping over-cap response body of {len(body)} bytes "
+                     f"(exceeds {MAX_RESPONSE_SIZE})")
+        return None
+    return bytes(body)
+
+
 @dataclass
 class CesrRequest:
     payload: dict
