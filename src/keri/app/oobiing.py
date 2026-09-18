@@ -664,6 +664,10 @@ class Authenticator:
 
     def request(self, wurl, obr):
         client = self.clienter.request("GET", wurl)
+        if client is None:  # blocked (address policy) or unbuildable; mirror Oobiery.request
+            self.hby.db.woobi.rem(keys=(wurl,))
+            print(f"error getting client for {wurl}, aborting wOOBI")
+            return
 
         self.clients[wurl] = client
         self.hby.db.woobi.rem(keys=(wurl,))
