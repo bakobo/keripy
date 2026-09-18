@@ -13,7 +13,8 @@ from hio.help import decking, Hict, ogler
 
 from socket import gaierror
 
-from .httping import Clienter, streamCESRRequests, checkUrl, CESR_DESTINATION_HEADER
+from .httping import (Clienter, streamCESRRequests, checkUrl,
+                      RedirectGuardedClient, CESR_DESTINATION_HEADER)
 
 from ..kering import (Schemes, Roles, ValidationError,
                       MissingEntryError, ConfigurationError)
@@ -856,11 +857,11 @@ class HTTPMessenger(doing.DoDoer):
             raise ValueError(f"invalid scheme {up.scheme} for HTTPMessenger")
 
         # address policy: refuse a witness endpoint that resolves to a blocked
-        # non-public host (raises kering.ValidationError). redirectable=False
-        # (relaxed to a revalidated budget in the per-hop redirect commit).
+        # non-public host (raises kering.ValidationError). A bounded, per-hop
+        # revalidated redirect budget keeps http->https ingress working.
         checkUrl(url)
-        self.client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname,
-                                            port=up.port, redirectable=False)
+        self.client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname,
+                                            port=up.port)
         clientDoer = http.clienting.ClientDoer(client=self.client)
 
         doers.extend([clientDoer])
@@ -929,8 +930,8 @@ class HTTPStreamMessenger(doing.DoDoer):
 
         # address policy on the message-send path (raises kering.ValidationError).
         checkUrl(url)
-        self.client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname,
-                                            port=up.port, redirectable=False)
+        self.client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname,
+                                            port=up.port)
         clientDoer = http.clienting.ClientDoer(client=self.client)
 
         headers = Hict([
@@ -1063,8 +1064,8 @@ def httpClient(hab, wit):
     url = urls[Schemes.https] if Schemes.https in urls else urls[Schemes.http]
     # address policy on the witness fetch/send path (raises kering.ValidationError).
     up = checkUrl(url)
-    client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname, port=up.port,
-                                   path=up.path, redirectable=False)
+    client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname, port=up.port,
+                                   path=up.path)
     clientDoer = http.clienting.ClientDoer(client=client)
 
     return client, clientDoer
