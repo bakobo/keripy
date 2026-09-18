@@ -13,7 +13,7 @@ from hio.help import decking, Hict, ogler
 
 from socket import gaierror
 
-from .httping import (Clienter, streamCESRRequests, checkUrl,
+from .httping import (Clienter, streamCESRRequests, checkUrl, boundedResponseBody,
                       RedirectGuardedClient, CESR_DESTINATION_HEADER)
 
 from ..kering import (Schemes, Roles, ValidationError,
@@ -109,8 +109,11 @@ class Receiptor(doing.DoDoer):
                 yield self.tock
 
             rep = client.respond()
-            if rep.status == 200:
-                hab.psr.parseOne(bytearray(rep.body))
+            # Bound what we copy/parse from the witness; boundedResponseBody
+            # never raises into this generator.
+            body = boundedResponseBody(rep) if rep.status == 200 else None
+            if rep.status == 200 and body is not None:
+                hab.psr.parseOne(bytearray(body))
                 rcts[wit] = None
             else:
                 print(f"invalid response {rep.status} from witnesses {wit}")
@@ -183,12 +186,17 @@ class Receiptor(doing.DoDoer):
             yield self.tock
 
         rep = client.respond()
-        if rep.status == 200:
-            rct = bytearray(rep.body)
-            hab.psr.parseOne(bytearray(rct))
+        ok = rep.status == 200
+        if ok:
+            # Bound what we copy/parse; boundedResponseBody never raises here.
+            body = boundedResponseBody(rep)
+            if body is not None:
+                hab.psr.parseOne(bytearray(body))
+            else:
+                ok = False
 
         self.clienter.remove(client)
-        return rep.status == 200
+        return ok
 
     def catchup(self, pre, wit):
         """
