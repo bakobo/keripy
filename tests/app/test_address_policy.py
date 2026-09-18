@@ -107,7 +107,7 @@ def test_clienter_request_allows_private_by_default(monkeypatch):
         def request(self, **kwa):
             pass
 
-    monkeypatch.setattr(httping.http.clienting, "Client", FakeClient)
+    monkeypatch.setattr(httping, "RedirectGuardedClient", FakeClient)
     monkeypatch.setattr(httping.http.clienting, "ClientDoer",
                         lambda client=None: object())
 
@@ -122,8 +122,9 @@ def test_clienter_request_allows_private_by_default(monkeypatch):
 # --- cover the message-send paths + httpClient ---------------------
 
 def _fakeHioClient(monkeypatch):
-    """Replace agenting's hio Client/ClientDoer with capturing fakes so no socket
-    is opened; returns the dict that captures Client(**kwargs)."""
+    """Replace agenting's client class (RedirectGuardedClient) and ClientDoer with
+    capturing fakes so no socket is opened; returns the dict that captures the
+    client constructor kwargs."""
     from keri.app import agenting
     built = {}
 
@@ -136,7 +137,7 @@ def _fakeHioClient(monkeypatch):
         def request(self, **kwa):
             pass
 
-    monkeypatch.setattr(agenting.http.clienting, "Client", FakeClient)
+    monkeypatch.setattr(agenting, "RedirectGuardedClient", FakeClient)
     monkeypatch.setattr(agenting.http.clienting, "ClientDoer",
                         lambda client=None: object())
     return built
@@ -149,12 +150,14 @@ def test_http_messenger_blocks_metadata(monkeypatch):
         HTTPMessenger(hab=None, wit="EWit", url="http://169.254.169.254/")
 
 
-def test_http_messenger_sets_no_redirect_and_allows_public(monkeypatch):
+def test_http_messenger_uses_guarded_client_for_public(monkeypatch):
     from keri.app.agenting import HTTPMessenger
     built = _fakeHioClient(monkeypatch)
     HTTPMessenger(hab=None, wit="EWit", url="http://8.8.8.8/")
-    assert built["redirectable"] is False
+    # constructed via RedirectGuardedClient (the fake), and not forced to a zero
+    # redirect budget (redirectable is defaulted True inside the guarded client).
     assert built["hostname"] == "8.8.8.8"
+    assert built.get("redirectable", True) is not False
 
 
 def test_http_stream_messenger_blocks_metadata(monkeypatch):
@@ -165,11 +168,12 @@ def test_http_stream_messenger_blocks_metadata(monkeypatch):
                             url="http://169.254.169.254/", msg=b"x")
 
 
-def test_http_stream_messenger_sets_no_redirect(monkeypatch):
+def test_http_stream_messenger_uses_guarded_client(monkeypatch):
     from keri.app.agenting import HTTPStreamMessenger
     built = _fakeHioClient(monkeypatch)
     HTTPStreamMessenger(hab=None, wit="EWit", url="http://8.8.8.8/", msg=b"x")
-    assert built["redirectable"] is False
+    assert built["hostname"] == "8.8.8.8"
+    assert built.get("redirectable", True) is not False
 
 
 def test_http_client_blocks_metadata(monkeypatch):
@@ -186,7 +190,7 @@ def test_http_client_blocks_metadata(monkeypatch):
         agenting.httpClient(FakeHab(), "EWit")
 
 
-def test_http_client_sets_no_redirect(monkeypatch):
+def test_http_client_uses_guarded_client(monkeypatch):
     from keri.app import agenting
     from keri import kering
     built = _fakeHioClient(monkeypatch)
@@ -198,4 +202,5 @@ def test_http_client_sets_no_redirect(monkeypatch):
             return {}
 
     agenting.httpClient(FakeHab(), "EWit")
-    assert built["redirectable"] is False
+    assert built["hostname"] == "8.8.8.8"
+    assert built.get("redirectable", True) is not False
