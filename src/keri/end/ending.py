@@ -408,8 +408,13 @@ class PointEnd(base.Tymee):
     def on_post(self, req, rep, aid, role):
         """
         Handles POST requests"""
+        # Local import avoids a circular import (app.httping imports the end pkg).
+        from ..app.httping import readBoundedBody
         try:
-            raw = req.bounded_stream.read()
+            # Bound the body before reading it.
+            raw = readBoundedBody(req)
+        except falcon.HTTPError:
+            raise
         except Exception:
             raise falcon.HTTPError(falcon.HTTP_400,
                                    title='Read Error',

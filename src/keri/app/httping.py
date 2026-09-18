@@ -28,6 +28,17 @@ CESR_CONTENT_TYPE = "application/cesr"
 CESR_ATTACHMENT_HEADER = "CESR-ATTACHMENT"
 CESR_DESTINATION_HEADER = "CESR-DESTINATION"
 
+#: Maximum size in bytes of an inbound HTTP request body keripy will read from a
+#: front-door route. A KERI event plus its CESR attachment set is a few KB even
+#: for a large multisig or credential-chain POST; 5 MiB leaves room for hundreds
+#: of events while refusing the unbounded body that exhausts memory. NOTE:
+#: this is a PARTIAL mitigation. hio buffers the whole request body before falcon
+#: dispatches, so this handler-level check runs after the bytes are resident; it
+#: removes the json.load amplification and rejects an over-declared Content-Length
+#: without parsing, but full closure of the oversize-body case requires a
+#: body limit in the hio HTTP server layer.
+MAX_CESR_BODY_SIZE = 5 * 1024 * 1024
+
 #: URL schemes keripy will fetch. Anything else (file://, gopher://, ...) is an
 #: fetch target, never a legitimate KERI endpoint.
 ALLOWED_URL_SCHEMES = ("http", "https")
@@ -221,7 +232,9 @@ class SignatureValidationComponent(object):
 
         """
         sig = req.headers.get("SIGNATURE")
-        ked = req.media
+        # Bound the body before parsing it.
+        raw = readBoundedBody(req)
+        ked = json.loads(raw)
         ser = json.dumps(ked).encode("utf-8")
         if not self.validate(sig=sig, ser=ser):
             resp.complete = True
@@ -249,6 +262,44 @@ class SignatureValidationComponent(object):
         return True
 
 
+def enforceMaxBody(req, limit=MAX_CESR_BODY_SIZE):
+    """Reject a declared Content-Length over ``limit`` with 413 before the body is
+    read at all. PARTIAL: hio has already buffered the body by the time a falcon
+    handler runs, so this cannot fully close the oversize-body case (that
+    needs an hio server-layer limit); it removes parse amplification and refuses
+    an honestly-declared over-cap request without copying it.
+
+    Parameters:
+        req (falcon.Request): inbound request.
+        limit (int): maximum allowed body size in bytes.
+    """
+    clen = req.content_length
+    if clen is not None and clen > limit:
+        raise falcon.HTTPError(falcon.HTTP_413,
+                               title="Request body too large",
+                               description=f"Request body of {clen} bytes exceeds "
+                                           f"the maximum allowed size of {limit} bytes.")
+
+
+def readBoundedBody(req, limit=MAX_CESR_BODY_SIZE):
+    """Reject an over-cap declared Content-Length, then read at most ``limit`` bytes
+    (+1 to detect overflow) so an undeclared / chunked body is bounded on read
+    too. Returns the raw body bytes. Raises falcon HTTP 413 if over the cap.
+
+    Parameters:
+        req (falcon.Request): inbound request.
+        limit (int): maximum allowed body size in bytes.
+    """
+    enforceMaxBody(req, limit)
+    raw = req.bounded_stream.read(limit + 1)
+    if len(raw) > limit:
+        raise falcon.HTTPError(falcon.HTTP_413,
+                               title="Request body too large",
+                               description=f"Request body exceeds the maximum "
+                                           f"allowed size of {limit} bytes.")
+    return raw
+
+
 @dataclass
 class CesrRequest:
     payload: dict
@@ -269,8 +320,11 @@ def parseCesrHttpRequest(req):
                                title="Content type error",
                                description="Unacceptable content type.")
 
+    # Bound the body before parsing: rejects an over-cap declared Content-Length
+    # with 413 and removes the json.load amplification.
+    raw = readBoundedBody(req)
     try:
-        data = json.load(req.bounded_stream)
+        data = json.loads(raw)
     except ValueError:
         raise falcon.HTTPError(falcon.HTTP_400,
                                title="Malformed JSON",
