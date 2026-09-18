@@ -132,6 +132,79 @@ def checkUrl(url, *, blockPrivate=None):
     return purl
 
 
+#: Default maximum number of HTTP redirects keripy will follow. redirectable=False
+#: (a zero budget) breaks endpoints behind an http->https ingress (k8s 301/308);
+#: a small budget with per-hop revalidation keeps those working without letting a
+#: peer redirect keripy into a blocked range.
+MAX_REDIRECTS = 3
+
+
+class RedirectGuardedClient(http.clienting.Client):
+    """hio HTTP Client that follows a bounded number of redirects and re-runs the
+    address policy (checkUrl) on each redirect target before following it.
+
+    hio's Client redirects unconditionally when redirectable is True; setting it
+    False (a zero budget) breaks endpoints behind an http->https ingress. This
+    subclass allows redirects but caps them at maxRedirects and refuses any hop
+    whose resolved target fails checkUrl, so a peer cannot use a 3xx to redirect
+    keripy into 169.254.169.254 or another blocked range. A refused/over-budget redirect surfaces the 3xx as the terminal
+    response instead of being followed, so nothing crashes and the caller simply
+    sees a non-2xx result.
+    """
+
+    def __init__(self, *args, maxRedirects=MAX_REDIRECTS, blockPrivate=None, **kwa):
+        self.maxRedirects = maxRedirects
+        self._blockPrivate = blockPrivate
+        kwa.setdefault("redirectable", True)
+        super(RedirectGuardedClient, self).__init__(*args, **kwa)
+
+    def _redirectPermitted(self):
+        """Return True if the pending redirect (self.redirects[-1]) may be
+        followed: within the redirect budget AND its resolved target passes the
+        address policy. A relative/self redirect stays on the already-validated host,
+        so it re-validates trivially."""
+        if not self.redirects:
+            return True
+        if len(self.redirects) > self.maxRedirects:
+            logger.error(f"refusing redirect: exceeds budget of {self.maxRedirects}")
+            return False
+
+        latest = self.redirects[-1]
+        headers = latest.get("headers") or {}
+        location = headers.get("location")
+        if not location:
+            return True
+
+        req = latest.get("request") or {}
+        scheme = req.get("scheme") or getattr(self.requester, "scheme", "http")
+        host = req.get("host") or getattr(self.requester, "hostname", "")
+        port = req.get("port") or getattr(self.requester, "port", None)
+        base = f"{scheme}://{host}:{port}{req.get('path') or '/'}"
+        target = parse.urljoin(base, location)
+        try:
+            checkUrl(target, blockPrivate=self._blockPrivate)
+        except ValidationError as e:
+            logger.error(f"refusing redirect to {location!r}: {e}")
+            return False
+        return True
+
+    def redirect(self):
+        """Revalidate and budget-check before delegating to hio's redirect."""
+        if self.redirects and not self._redirectPermitted():
+            # Surface the 3xx as the terminal response rather than following it.
+            resp = self.redirects.pop()
+            if self.redirects:
+                resp["redirects"] = list(self.redirects)
+            self.redirects = []
+            self.responses.append(resp)
+            self.waited = False
+            if self.respondent is not None:
+                self.respondent.redirectant = False
+                self.respondent.redirected = False
+            return
+        return super(RedirectGuardedClient, self).redirect()
+
+
 class SignatureValidationComponent(object):
     """ Validate SKWA signatures """
 
@@ -362,7 +435,7 @@ class Clienter(doing.DoDoer):
             return None
 
         try:
-            client = http.clienting.Client(scheme=purl.scheme,
+            client = RedirectGuardedClient(scheme=purl.scheme,
                                            hostname=purl.hostname,
                                            port=purl.port,
                                            portOptional=True)
