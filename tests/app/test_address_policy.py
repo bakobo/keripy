@@ -117,3 +117,85 @@ def test_clienter_request_allows_private_by_default(monkeypatch):
     client = clienter.request("GET", "http://10.1.2.3/oobi")
     assert client is not None
     assert built["hostname"] == "10.1.2.3"
+
+
+# --- cover the message-send paths + httpClient ---------------------
+
+def _fakeHioClient(monkeypatch):
+    """Replace agenting's hio Client/ClientDoer with capturing fakes so no socket
+    is opened; returns the dict that captures Client(**kwargs)."""
+    from keri.app import agenting
+    built = {}
+
+    class FakeClient:
+        def __init__(self, **kwa):
+            built.update(kwa)
+            self.requests = []
+            self.responses = []
+
+        def request(self, **kwa):
+            pass
+
+    monkeypatch.setattr(agenting.http.clienting, "Client", FakeClient)
+    monkeypatch.setattr(agenting.http.clienting, "ClientDoer",
+                        lambda client=None: object())
+    return built
+
+
+def test_http_messenger_blocks_metadata(monkeypatch):
+    from keri.app.agenting import HTTPMessenger
+    _fakeHioClient(monkeypatch)
+    with pytest.raises(ValidationError):
+        HTTPMessenger(hab=None, wit="EWit", url="http://169.254.169.254/")
+
+
+def test_http_messenger_sets_no_redirect_and_allows_public(monkeypatch):
+    from keri.app.agenting import HTTPMessenger
+    built = _fakeHioClient(monkeypatch)
+    HTTPMessenger(hab=None, wit="EWit", url="http://8.8.8.8/")
+    assert built["redirectable"] is False
+    assert built["hostname"] == "8.8.8.8"
+
+
+def test_http_stream_messenger_blocks_metadata(monkeypatch):
+    from keri.app.agenting import HTTPStreamMessenger
+    _fakeHioClient(monkeypatch)
+    with pytest.raises(ValidationError):
+        HTTPStreamMessenger(hab=None, wit="EWit",
+                            url="http://169.254.169.254/", msg=b"x")
+
+
+def test_http_stream_messenger_sets_no_redirect(monkeypatch):
+    from keri.app.agenting import HTTPStreamMessenger
+    built = _fakeHioClient(monkeypatch)
+    HTTPStreamMessenger(hab=None, wit="EWit", url="http://8.8.8.8/", msg=b"x")
+    assert built["redirectable"] is False
+
+
+def test_http_client_blocks_metadata(monkeypatch):
+    """httpClient builds its URL from hab.fetchUrls; a metadata target is refused
+    with a caught MissingEntryError-style refusal (ValidationError)."""
+    from keri.app import agenting
+    _fakeHioClient(monkeypatch)
+
+    class FakeHab:
+        def fetchUrls(self, eid, scheme=None):
+            return {scheme: "http://169.254.169.254/"} if scheme == "http" else {}
+
+    with pytest.raises(ValidationError):
+        agenting.httpClient(FakeHab(), "EWit")
+
+
+def test_http_client_sets_no_redirect(monkeypatch):
+    from keri.app import agenting
+    from keri import kering
+    built = _fakeHioClient(monkeypatch)
+
+    class FakeHab:
+        def fetchUrls(self, eid, scheme=None):
+            if scheme == kering.Schemes.https:
+                return {kering.Schemes.https: "https://8.8.8.8/"}
+            return {}
+
+    agenting.httpClient(FakeHab(), "EWit")
+    assert built["redirectable"] is False
