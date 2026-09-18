@@ -31,7 +31,8 @@ from ..peer import Exchanger
 from .habbing import GroupHab
 from .directing import Directant
 from .storing import Mailboxer, Respondant
-from .httping import Clienter, createCESRRequest, parseCesrHttpRequest, CESR_CONTENT_TYPE
+from .httping import (Clienter, createCESRRequest, parseCesrHttpRequest,
+                      readBoundedBody, CESR_CONTENT_TYPE)
 from .forwarding import ForwardHandler
 from .agenting import httpClient
 from .oobiing import Oobiery, loadEnds as loadOobiingEnds
@@ -962,7 +963,8 @@ class HttpEnd:
         rep.set_header('Cache-Control', "no-cache")
         rep.set_header('connection', "close")
 
-        self.rxbs.extend(req.bounded_stream.read())
+        # Bound the mailbox PUT body before reading it.
+        self.rxbs.extend(readBoundedBody(req))
 
         rep.set_header('Content-Type', "application/json")
         rep.status = falcon.HTTP_204
