@@ -4,7 +4,9 @@ keri.peer.httping module
 
 """
 import datetime
+import ipaddress
 import json
+import socket
 from dataclasses import dataclass
 from urllib import parse
 
@@ -14,7 +16,7 @@ from hio.core import http
 from hio.help import Hict, ogler
 
 from ..kering import (ShortageError, ExtractionError,
-                      ColdStartError, sniff, Colds)
+                      ColdStartError, ValidationError, sniff, Colds)
 from ..core import SerderKERI
 from ..end import designature
 from ..help import nowUTC
@@ -25,6 +27,109 @@ logger = ogler.getLogger()
 CESR_CONTENT_TYPE = "application/cesr"
 CESR_ATTACHMENT_HEADER = "CESR-ATTACHMENT"
 CESR_DESTINATION_HEADER = "CESR-DESTINATION"
+
+#: URL schemes keripy will fetch. Anything else (file://, gopher://, ...) is an
+#: fetch target, never a legitimate KERI endpoint.
+ALLOWED_URL_SCHEMES = ("http", "https")
+
+#: When True, checkUrl additionally refuses RFC-1918 / ULA private ranges
+#: (10/8, 172.16/12, 192.168/16, fc00::/7). Default False: private-network
+#: witnesses / OOBIs are a normal KERI deployment and a private-IP fetch carries
+#: no KERI trust risk (the KEL/TEL is cryptographically verified regardless of
+#: fetch origin), so blocking them is availability loss for no doctrinal gain.
+#: This opt-in is DECOUPLED from the link-local / cloud-metadata block below,
+#: which is unconditional: flipping this flag never re-arms metadata access.
+BLOCK_PRIVATE_ADDRESSES = False
+
+
+def _addressBlocked(ip, blockPrivate):
+    """Return True if ip (an ipaddress object) is a destination keripy must not
+    fetch.
+
+    The truly-unroutable / infrastructure classes are blocked UNCONDITIONALLY
+    with no opt-out: link-local (169.254.0.0/16 and fe80::/10, which is how the
+    169.254.169.254 cloud-metadata access is reached), multicast, reserved and the
+    unspecified address. Loopback is always allowed (local dev / tests). RFC-1918
+    / ULA private ranges are allowed by default and only blocked when the
+    blockPrivate opt-in is set — decoupled from the classes above so an operator
+    can permit private OOBIs without ever re-arming metadata access.
+    """
+    if ip.is_loopback:  # local dev / tests use 127.0.0.1 / ::1
+        return False
+    # IPv4-mapped IPv6 (::ffff:169.254.169.254) already reports is_link_local via
+    # ipaddress, so the metadata block below covers the mapped form too.
+    if ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return True
+    if ip.is_private:  # RFC-1918 / ULA: opt-in only
+        return blockPrivate
+    return False
+
+
+def checkUrl(url, *, blockPrivate=None):
+    """Validate a URL before keripy fetches it, guarding against fetches steered by a
+    malicious designated witness or an introduced OOBI.
+
+    Enforces a scheme allow-list and refuses hosts that resolve to a link-local
+    (169.254.169.254 cloud metadata), multicast, reserved or unspecified address
+    unconditionally. RFC-1918 / ULA private ranges are allowed by default and
+    refused only when blockPrivate (or the module BLOCK_PRIVATE_ADDRESSES flag)
+    is set. Loopback is allowed. Literal-IP metadata/private targets are caught
+    directly; a hostname is resolved and each resolved address is checked, so
+    decimal/hex/octal-encoded and IPv4-mapped metadata forms are caught via the
+    resolver. A hostname that cannot be resolved is passed through (the fetch
+    fails on its own).
+
+    Parameters:
+        url (str): the URL about to be fetched.
+        blockPrivate (bool|None): opt-in to also block private ranges; None uses
+            the module default BLOCK_PRIVATE_ADDRESSES.
+
+    Returns:
+        the urlparse result on success.
+
+    Raises:
+        kering.ValidationError: if the scheme is not allowed or the host is a
+            blocked destination.
+    """
+    if blockPrivate is None:
+        blockPrivate = BLOCK_PRIVATE_ADDRESSES
+
+    purl = parse.urlparse(url)
+    if purl.scheme not in ALLOWED_URL_SCHEMES:
+        raise ValidationError(f"Invalid URL scheme {purl.scheme!r}; only "
+                              f"{ALLOWED_URL_SCHEMES} are fetched. url={url!r}")
+    host = purl.hostname
+    if not host:
+        raise ValidationError(f"URL {url!r} has no host.")
+
+    try:  # literal IP address?
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if _addressBlocked(ip, blockPrivate):
+            raise ValidationError(f"URL host {host} is a blocked non-public "
+                                  f"address; refusing to fetch (address policy). url={url!r}")
+        return purl
+
+    # a hostname (which may be a decimal/hex/octal-encoded IP): block if it
+    # resolves to a blocked address; if it cannot be resolved, let the fetch
+    # itself fail rather than false-positive here.
+    try:
+        infos = socket.getaddrinfo(host, purl.port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        infos = []
+    for info in infos:
+        try:
+            rip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _addressBlocked(rip, blockPrivate):
+            raise ValidationError(f"URL host {host} resolves to blocked "
+                                  f"non-public address {rip}; refusing to fetch "
+                                  f"(address policy). url={url!r}")
+    return purl
 
 
 class SignatureValidationComponent(object):
@@ -250,7 +355,11 @@ class Clienter(doing.DoDoer):
         Returns:
             http.clienting.Client: The hio HTTP Client used for the request, or None if an error occurs.
         """
-        purl = parse.urlparse(url)
+        try:  # address policy: scheme allow-list + block non-public hosts
+            purl = checkUrl(url)
+        except ValidationError as e:
+            logger.error(f"refusing to fetch blocked url={url!r}: {e}")
+            return None
 
         try:
             client = http.clienting.Client(scheme=purl.scheme,
