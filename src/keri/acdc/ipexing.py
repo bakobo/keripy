@@ -838,7 +838,10 @@ class IpexHandler:
 
         return matched
 
-    def _evaluateGroupEdge(self, group, *, nodes, nserder, nested, inheritedSchema):
+    MaxEdgeGroupDepth = 24  # cap on nested edge-group recursion depth
+
+    def _evaluateGroupEdge(self, group, *, nodes, nserder, nested, inheritedSchema,
+                           _depth=0):
         """Evaluate one disclosed edge group and reduce its child results.
 
         Parameters:
@@ -853,6 +856,8 @@ class IpexHandler:
                 top-level edge section.
             inheritedSchema (str | Mapping | None): Optional schema pin passed
                 down from the parent edge group.
+            _depth (int): internal nesting depth, capped at MaxEdgeGroupDepth.
+                Not part of the public interface.
 
         Returns:
             bool | None: ``True`` when the group is well-formed and its child
@@ -861,6 +866,16 @@ class IpexHandler:
                 result fails, or ``None`` when the group shape is malformed and
                 verification must fail closed.
         """
+        # Guard against a crafted grant carrying deeply nested edge groups,
+        # which would otherwise raise a raw RecursionError.
+        # Fail CLOSED by returning None, matching the _evaluate* family contract
+        # and the caller (`if matched is not True: return False`), which does not
+        # catch exceptions -- raising here would propagate past the caller
+        # instead of failing verification closed. Legitimate edge sections
+        # nest only a few levels deep, well within the cap.
+        if _depth > self.MaxEdgeGroupDepth:
+            return None
+
         # Top-level edge sections and nested edge groups allow slightly
         # different reserved labels, so choose the right set up front.
         labels = EdgeGroupLabels if nested else EdgeSectionLabels
@@ -891,7 +906,8 @@ class IpexHandler:
                                                   nodes=nodes,
                                                   nserder=nserder,
                                                   nested=True,
-                                                  inheritedSchema=nextSchema)
+                                                  inheritedSchema=nextSchema,
+                                                  _depth=_depth + 1)
             if matched is None:
                 return None
             results.append(matched)
