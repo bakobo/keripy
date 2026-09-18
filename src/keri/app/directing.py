@@ -311,6 +311,20 @@ class Directant(doing.DoDoer):
         opts (dict): Injected options passed to the .do generator.
         doers (list): Scheduled Doer instances or generator functions."""
 
+    #: Maximum number of concurrent inbound TCP connections (live Reactants).
+    #: Directant previously spawned one Reactant per connection with no bound,
+    #: so the number of connections was unbounded.
+    #: New connections beyond this cap are closed
+    #: immediately rather than served.
+    #:
+    #: Kept a few hundred, deliberately BELOW the default per-process file
+    #: descriptor ceiling (ulimit -n, commonly 1024): each live connection
+    #: holds a socket fd, so a cap at or above that ceiling lets EMFILE strike
+    #: at the same point and the cap does little on a default host. A witness in
+    #: normal operation talks to a small, bounded set of peers, so 256 is ample
+    #: headroom while still leaving fds for logs, the database, and dependencies.
+    MaxTCPConnections = 256
+
     def __init__(self, hab, server, verifier=None, exchanger=None, doers=None, **kwa):
         """Initialize instance and extend doers with serviceDo.
 
@@ -351,6 +365,12 @@ class Directant(doing.DoDoer):
         self.server.wind(tymth)
 
 
+    def atConnectionLimit(self):
+        """Return True if the number of live Reactants has reached the
+        configured maximum concurrent-connection cap (MaxTCPConnections)."""
+        return len(self.rants) >= self.MaxTCPConnections
+
+
     def serviceDo(self, tymth=None, tock=0.0, **opts):
         """Doer that services inbound connections and manages Reactant lifecycle.
 
@@ -379,6 +399,12 @@ class Directant(doing.DoDoer):
                     continue
 
                 if ca not in self.rants:  # create Reactant and extend doers with it
+                    if self.atConnectionLimit():  # refuse new conns over the cap
+                        logger.info("Server %s: refusing connection %s, at max "
+                                    "concurrent connections %d.",
+                                    self.hab.name, ca, self.MaxTCPConnections)
+                        self.closeConnection(ca)
+                        continue
                     rant = Reactant(tymth=self.tymth, hab=self.hab, verifier=self.verifier,
                                     exchanger=self.exchanger, remoter=ix)
                     self.rants[ca] = rant
