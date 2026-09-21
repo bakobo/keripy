@@ -7420,16 +7420,17 @@ class Kevery:
         This allows FIFO processing of events with same prefix and sn but different
         digest.
 
-        Uses  .db.addLde(self, key, val) which is IOVal with dups.
+        Uses  .db.ldes.add(keys=pre, on=sn, val=said), an OnIoDupSuber with
+        insertion-ordered duplicates.
 
-        Value is dgkey for event stored in .Evt where .Evt has serder.raw of event.
+        Value is the event SAID for event stored in .evts.
 
         Original Escrow steps:
             dgkey = dgKey(pre, serder.dig)
             self.db.dtss.put(keys=dgkey, val=Dater())
             self.db.sigs.put(keys=dgkey, vals=sigers)
             self.db.evts.put(keys=(pre, serder.dig), val=serder)
-            self.db.addLde(snKey(pre, sn), serder.digb)
+            self.db.ldes.add(keys=serder.preb, on=serder.sn, val=serder.saidb)
             where:
                 serder is SerderKERI instance of  event
                 sigers is list of Siger instance for  event
