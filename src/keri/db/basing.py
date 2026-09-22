@@ -46,7 +46,7 @@ def _strip_prerelease(version_str):
 MIGRATIONS = [
     ("0.6.8", ["hab_data_rename"]),
     ("1.0.0", ["add_key_and_reg_state_schemas"]),
-    ("1.2.0", ["rekey_habs"])
+    ("1.2.0", ["rekey_habs"]),
 ]
 
 
@@ -580,6 +580,14 @@ class Baser(LMDBer):
             subkey 'essrs.'
             Multiple values per key.
 
+        .ests is named subDB instance of CatCesrIoSetSuber
+            (klas=(Number, Diger)) for resolved exchange source seals.
+            subkey 'ests.'
+            Key: exchange message SAID and sealing AID.
+            Value: sealing KEL event sequence number and SAID.
+            Multiple values per key are allowed. The exchange message in
+            ``exns`` remains the acceptance marker.
+
         .chas is named subDB instance of CesrIoSetSuber (klas=Diger) for
             accepted signed 12-word challenge response exn messages. Keyed by
             prefix of signer.
@@ -767,8 +775,8 @@ class Baser(LMDBer):
 
         .kramPMSK is named subDB instance of CatCesrSuber (klas=(Number, Diger))
             for KRAM partially signed multi-key sender key state records. Maps
-            (AID, MID) key to (sn, event SAID) couple identifying the sender's
-            key state.
+            (AID, MID) key to (sn, establishment event SAID) couple identifying
+            the sender's key state.
             subkey 'pmsk.'
             Only one value per DB key is allowed.
 
@@ -779,7 +787,8 @@ class Baser(LMDBer):
             Value is (Prefixer, Number, Diger, Siger) tuple. Sourced from
             parser kwa key 'trqs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramTSGS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key trans last sig group attachments. Each group is
@@ -789,7 +798,27 @@ class Baser(LMDBer):
             Value is (Prefixer, Number, Diger, Siger) tuple. Sourced from
             parser kwa key 'tsgs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
+
+        .kramULGS is named subDB instance of CesrIoSetSuber (klas=Prefixer) for
+            foreign last signature groups that KRAM could not resolve when a
+            partial message was received.
+            subkey 'ulgs.'
+            DB is keyed by (AID, MID): sender identifier prefix plus message SAID.
+            Values identify unresolved foreign signer prefixes. Multiple values
+            per key are allowed.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
+
+        .kramCIGS is named subDB instance of CatCesrIoSetSuber
+            (klas=(Verfer, Cigar)) for foreign nontransferable signatures on
+            partially signed multi-key messages.
+            subkey 'cigs.'
+            DB is keyed by (AID, MID): sender identifier prefix plus message SAID.
+            Multiple values per key are allowed.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramSSCS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key first seen seal couple attachments from issuing or
@@ -798,7 +827,8 @@ class Baser(LMDBer):
             DB is keyed by (AID, MID): sender identifier prefix plus message SAID
             Value is (Number, Diger) tuple. Sourced from parser kwa key 'sscs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramSSTS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key source seal triple attachments from issued or
@@ -808,7 +838,8 @@ class Baser(LMDBer):
             Value is (Prefixer, Number, Diger) tuple. Sourced from parser kwa
             key 'ssts'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramFRCS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key first seen replay couple attachments.
@@ -816,7 +847,8 @@ class Baser(LMDBer):
             DB is keyed by (AID, MID): sender identifier prefix plus message SAID
             Value is (Number, Dater) tuple. Sourced from parser kwa key 'frcs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramTDCS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key typed digest seal couple attachments.
@@ -824,7 +856,8 @@ class Baser(LMDBer):
             DB is keyed by (AID, MID): sender identifier prefix plus message SAID
             Value is (Verser, Diger) tuple. Sourced from parser kwa key 'tdcs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramPTDS is named subDB instance of IoSetSuber for KRAM partially signed
             multi-key pathed stream attachments.
@@ -833,7 +866,8 @@ class Baser(LMDBer):
             Value is raw bytes of pathed CESR stream. Sourced from parser kwa
             key 'ptds'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramBSQS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key blind state quadruple attachments.
@@ -842,7 +876,8 @@ class Baser(LMDBer):
             Value is (Diger, Noncer, Noncer, Labeler) tuple. Sourced from
             parser kwa key 'bsqs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramBSSS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key bound state sextuple attachments.
@@ -851,7 +886,8 @@ class Baser(LMDBer):
             Value is (Diger, Noncer, Noncer, Labeler, Number, Noncer) tuple.
             Sourced from parser kwa key 'bsss'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
         .kramTMQS is named subDB instance of CatCesrIoSetSuber for KRAM partially
             signed multi-key type media quadruple attachments.
@@ -860,7 +896,8 @@ class Baser(LMDBer):
             Value is (Diger, Noncer, Labeler, Texter) tuple. Sourced from
             parser kwa key 'tmqs'.
             Multiple values per key stored as ordered set (duplicates ignored).
-            Entries persist until removed by the KRAM pruner.
+            KRAM removes entries after it forwards the message, detects a sender
+            key-state change, or prunes the incomplete message.
 
     Properties:
         kevers (statedict): read through cache of kevers of states for KELs in db
@@ -1115,6 +1152,10 @@ class Baser(LMDBer):
 
         self.essrs = subing.CesrIoSetSuber(db=self, subkey="essrs.", klas=coring.Texter)
 
+        # resolved exchange source seals indexed by message and sealing AID
+        self.ests = subing.CatCesrIoSetSuber(db=self, subkey="ests.",
+                                             klas=(coring.Number, coring.Diger))
+
         # accepted signed 12-word challenge response exn messages keys by prefix of signer
         # TODO: clean
         self.chas = subing.CesrIoSetSuber(db=self, subkey='chas.', klas=coring.Diger)
@@ -1310,6 +1351,14 @@ class Baser(LMDBer):
         self.kramTSGS = subing.CatCesrIoSetSuber(db=self, subkey='tsgs.',
                                                   klas=(coring.Prefixer, coring.Number,
                                                         coring.Diger, indexing.Siger))
+
+        # ulgs: foreign last signature groups unresolved at receipt
+        self.kramULGS = subing.CesrIoSetSuber(db=self, subkey='ulgs.',
+                                             klas=coring.Prefixer)
+
+        # cigs: foreign nontransferable signatures (verfer, cigar)
+        self.kramCIGS = subing.CatCesrIoSetSuber(
+            db=self, subkey='cigs.', klas=(coring.Verfer, coring.Cigar))
 
         # sscs: first seen seal couples (number, diger) issuing or delegating
         self.kramSSCS = subing.CatCesrIoSetSuber(db=self, subkey='sscs.',
@@ -1544,6 +1593,11 @@ class Baser(LMDBer):
         Database usage should be offline during cleaning as it will be cloned in
         readonly mode
 
+        Copy KRAM replay caches without reverification. Discard cache types
+        and partial state; Kramer rebuilds cache types from configuration.
+        Retained replay markers require retries to use a new datetime and
+        new signatures.
+
         Parameters:
             gvrsn (Versionage): CESR genus version for clone attachments and parser
             version (Versionage): legacy alias for gvrsn
@@ -1583,7 +1637,8 @@ class Baser(LMDBer):
                 unsecured = ["hbys", "schema", "states", "rpys", "eans", "tops", "cgms", "exns", "erpy",
                              "kdts", "ksns", "knas", "oobis", "roobi", "woobi", "moobi", "mfa", "rmfa",
                              "cfld", "cons", "ccigs", "cdel", "migs",
-                             "ifld", "sids", "icigs"]
+                             "ifld", "sids", "icigs",
+                             "kramMSGC", "kramTMSC", "kramXDT"]
 
                 for name in unsecured:
                     srcdb = getattr(self, name)
@@ -1594,11 +1649,15 @@ class Baser(LMDBer):
                 # This is the list of set based databases that are not created as part of event processing.
                 # for now we are just copying them from self to copy without worrying about being able to
                 # reprocess them.  We need a more secure method in the future
-                sets = ["esigs", "ecigs", "epath", "enst", "chas", "reps", "wkas", "meids", "maids"]
+                evidence = ["esigs", "ecigs", "epath", "enst", "essrs", "ests"]
+                accepted = {said for (said,), _ in self.exns.getTopItemIter()}
+                sets = evidence + ["chas", "reps", "wkas", "meids", "maids"]
                 for name in sets:
                     srcdb = getattr(self, name)
                     cpydb = getattr(copy, name)
                     for keys, val in srcdb.getTopItemIter():
+                        if name in evidence and keys[0] not in accepted:
+                            continue
                         cpydb.add(keys=keys, val=val)
 
                 # Copy imgs (blinded media for remote identifiers)
@@ -1766,27 +1825,26 @@ class Baser(LMDBer):
                 cigar.verfer = prefixer  # assign verfer
                 cigars.append(cigar)
 
-        # get trans receipt/endorsement attachments not controller
-        # vrcsNew get non-controller trans receipt attachments
+        # get non-controller trans endorsement attachments from vrcs
         # may have been originally non-controller sigs or receipted endorsements
         topkeys = (pre, dig)
-        rsets = dict()  # collate  by triple of rpre,rsnh,rdig
+        tsets = dict()  # collate  by triple of tpre,tsnh,tdig
         for quintkeys, siger in self.vrcs.getTopItemIter(keys=topkeys):
-            epre, edig, rpre, rsnh, rdig = quintkeys  # expand quintkeys tuple
-            triple = (rpre, rsnh, rdig)  # create triple of receiptor/endorser
-            if triple not in rsets:
-                rsets[triple] = [siger]
+            epre, edig, tpre, tsnh, tdig = quintkeys  # expand quintkeys tuple
+            triple = (tpre, tsnh, tdig)  # create triple of receiptor/endorser
+            if triple not in tsets:
+                tsets[triple] = [siger]
             else:
-                rsets[triple].append(siger)
+                tsets[triple].append(siger)
 
-        rsgs = []
-        if rsets:  # convert rsets dict to rsgs list of tuples
-            for triple, rigers in rsets.items():
-                rpre, rsnh, rdig = triple
-                rsgs.append((Prefixer(qb64=rpre),
-                             Number(snh=rsnh),
-                             Diger(qb64=rdig),
-                             rigers))
+        tsgs = []
+        if tsets:  # convert tsets dict to tsgs list of tuples
+            for triple, tigers in tsets.items():
+                tpre, tsnh, tdig = triple
+                tsgs.append((Prefixer(qb64=tpre),
+                             Number(snh=tsnh),
+                             Diger(qb64=tdig),
+                             tigers))
 
 
         # get authorizer (delegator/issuer) source seal event couple if any
@@ -1803,124 +1861,8 @@ class Baser(LMDBer):
 
 
         msg = messagize(serder=serder, sigers=sigers, wigers=wigers,
-                        cigars=cigars, rsgs=rsgs, bonds=bonds, gvrsn=gvrsn)
+                        cigars=cigars, tsgs=tsgs, bonds=bonds, gvrsn=gvrsn)
         return msg
-
-
-
-    #def cloneEvtMsgOld(self, pre, fn, dig, version=Vrsn_1_0):
-        #"""
-        #Clones Event as Serialized CESR Message with Body and attached Foot
-
-        #Parameters:
-            #pre (bytes): identifier prefix of event
-            #fn (int): first seen number (ordinal) of event
-            #dig (bytes): digest of event
-            #version (Versionage): CESR Genus version for attachment group codes
-
-
-        #Returns:
-            #bytearray: message body with attachments
-        #"""
-        #from ..core import coring
-        #from ..core.counting import Counter, Codens
-        #from ..core.structing import  SealSource
-
-        #msg = bytearray()  # message
-        #atc = bytearray()  # attachments
-        #dgkey = dgKey(pre, dig)  # get message
-        #if not (serder := self.evts.get(keys=(pre, dig))):
-            #raise MissingEntryError("Missing event for dig={}.".format(dig))
-        #msg.extend(serder.raw)
-
-        ## add indexed signatures to attachments
-        #if not (sigers := self.sigs.get(keys=dgkey)):
-            #raise MissingEntryError("Missing sigs for dig={}.".format(dig))
-        #atc.extend(Counter(code=Codens.ControllerIdxSigs,
-                           #count=len(sigers), version=Vrsn_1_0).qb64b)
-        #for siger in sigers:
-            #atc.extend(siger.qb64b)
-
-        ## add indexed witness signatures to attachments
-        #if wigers := self.wigs.get(keys=dgkey):
-            #atc.extend(Counter(code=Codens.WitnessIdxSigs,
-                               #count=len(wigers), version=Vrsn_1_0).qb64b)
-            #for wiger in wigers:
-                #atc.extend(wiger.qb64b)
-
-        ## add nontrans endorsement couples to attachments not witnesses
-        ## may have been originally key event attachments or receipted endorsements
-        #if coups := self.rcts.get(keys=dgkey):
-            #atc.extend(Counter(code=Codens.NonTransReceiptCouples,
-                               #count=len(coups), version=Vrsn_1_0).qb64b)
-            #for prefixer, cigar in coups:
-                #atc.extend(prefixer.qb64b)
-                #atc.extend(cigar.qb64b)
-
-        ## add trans endorsement attachments not controller
-        ## may have been originally key event attachments or receipted endorsements
-        ## vrcsNew add non-controller trans endorsement attachments
-        ## may have been originally non-controller sigs or receipted endorsements
-        ## collate sigersets by triple of rpre,rsnh,rdig
-        #topkeys = (pre, dig)
-        #sigersets = dict()
-        #for keys, siger in self.vrcs.getTopItemIter(keys=topkeys):
-            #epre, edig, rpre, rsnh, rdig = keys  # expand keys tuple
-            #triple = (rpre, rsnh, rdig)
-            #if triple not in sigersets:
-                #sigersets[triple] = [siger]
-            #else:
-                #sigersets[triple].append(siger)
-
-        ## create and attach an attachment group per sigerset
-        #if sigersets:
-            #cims = bytearray()
-            #for keys, sigers in sigersets.items():
-                #sims = bytearray()
-                #sims.extend(Counter(code=Codens.ControllerIdxSigs,
-                                    #count=len(sigers),
-                                    #version=Vrsn_1_0).qb64b)
-                #for siger in sigers:
-                    #sims.extend(siger.qb64b)
-
-                ##sims = Counter.enclose(qb64=sims,
-                                       ##code=Codens.ControllerIdxSigs,
-                                       ##version=Vrsn_2_0)
-                #rpre, rsnh, rdig = keys
-                #cims.extend(rpre.encode() + coring.Number(snh=rsnh).qb64b + rdig.encode())
-                #cims.extend(sims)
-            #gims = Counter.enclose(qb64=cims,
-                                       #code=Codens.TransReceiptIdxSigGroups,
-                                       #version=Vrsn_1_0)
-            #atc.extend(gims)
-
-
-
-        ## add authorizer (delegator/issuer) source seal event couple to attachments
-        #if (duple := self.aess.get(keys=(pre, dig))) is not None:
-            #number, diger = duple
-            #atc.extend(Counter(code=Codens.SealSourceCouples,
-                               #count=1, version=Vrsn_1_0).qb64b)
-            #atc.extend(number.qb64b + diger.qb64b)
-
-
-        ## add first seen replay couple to attachments
-        #if not (dater := self.dtss.get(keys=dgkey)):
-            #raise MissingEntryError("Missing datetime for dig={}.".format(dig))
-        #atc.extend(Counter(code=Codens.FirstSeenReplayCouples,
-                           #count=1, version=Vrsn_1_0).qb64b)
-        #atc.extend(coring.Number(num=fn).qb64b)  # may not need to be Huge
-        #atc.extend(dater.qb64b)
-
-        ## enclose attachments in AttachmentGroup
-        #if len(atc) % 4:
-            #raise SerializeError("Invalid attachments size={}, nonintegral"
-                             #" quadlets.".format(len(atc)))
-        #pcnt = Counter(code=Codens.AttachmentGroup,
-                       #count=(len(atc) // 4), version=Vrsn_1_0).qb64b
-        #msg.extend(pcnt)
-        #msg.extend(atc)
-        #return msg
 
 
     def cloneDelegation(self, kever, gvrsn=Version, *, version=None):

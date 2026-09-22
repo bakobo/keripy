@@ -29,9 +29,9 @@ import pytest
 
 from keri import kering
 from keri import Vrsn_2_0, Ilks
-from keri.core import Blinder, BlindState, Diger, SerderACDC
+from keri.core import Blinder, BlindState, Diger, Number, SerderACDC
 from keri.core.signing import Salter
-from keri.acdc import regcept, blindate, acdcmap
+from keri.acdc import Registry, Regery, regcept, blindate, acdcmap
 from keri.acdc import regeventing
 from keri.acdc.regeventing import RegStateRecord, vet, vetBlind
 from keri.app import habbing
@@ -47,9 +47,11 @@ STAMP3 = '2025-10-01T18:06:10.988921+00:00'
 # The verify path itself never sees it (that absence is row V23).
 SALT = Salter(raw=b'0123456789abcdef').qb64
 
-# The ACDC specification's BLID conformance vectors (spec-body.md ~:2166-2170
-# placeholder, ~:2209-2213 issued).  Lineage caveat: the spec's worked examples
-# were synced from keripy, so these defend against drift, not shared error.
+# The ACDC specification's BLID conformance vectors, from Blinded State Disclosure >
+# Blinded Attribute Block Placeholder Calculation Example (placeholder) and > Blinded
+# Attribute Block ACDC State Calculation Example (issued).  Lineage caveat: the spec's
+# worked examples were synced from keripy, so these defend against drift, not shared
+# error.
 SPEC_PLACEHOLDER_UUID = "aG1lSjdJSNl7TiroPl67Uqzd5eFvzmr6bPlL7Lh4ukv8"
 SPEC_PLACEHOLDER_BLID = "ECVr7QWEp_aqVQuz4yprRFXVxJ-9uWLx_d6oDinlHU6J"
 SPEC_ISSUED_UUID = "aLfCdNAnc-0P2SiruarZSajXiUWu5iU2VfQahvpNCyzB"
@@ -258,6 +260,45 @@ def test_V7_field_order_and_said_mutations_refused():
                 SerderACDC(raw=traw)
 
 
+def test_shared_tel_validation_kernel_rejects_overlap_rules():
+    """The shared TEL validators reject the malformed field combinations both sides care about."""
+    with openIssuer("shared-kernel") as (hby, hab):
+        # Set up 2 registry, and one ACDC
+        ripper = makeRegistry(hab, anchored=False)
+        acdc = makeAcdc(hab, regid=ripper.said)
+        other = makeRegistry(hab, stamp=STAMP2, anchored=False)
+
+        # sn = 0 for rip
+        bad_rip = remake(ripper, n='1')
+        with pytest.raises(kering.MissequenceError):
+            regeventing._validateRip(bad_rip, issuer=hab.pre)
+
+        # issuer is unknown
+        foreign_rip = remake(ripper, i="EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        with pytest.raises(kering.ValidationError):
+            regeventing._validateRip(foreign_rip, issuer=hab.pre)
+
+        # sn = 0 for bup
+        with pytest.raises(ValueError):  # blindate now raises ValueError if attempt sn=0
+            _, zero_bup = makeUpdate(ripper.said, ripper.said, acdc.said, 'issued',
+                                 sn=0, stamp=STAMP1)
+        #with pytest.raises(kering.MissequenceError):
+            #regeventing._validateUpdate(zero_bup, regid=ripper.said)
+
+        # registry mismatch
+        _, stray = makeUpdate(other.said, ripper.said, acdc.said, 'issued',
+                              sn=1, stamp=STAMP1)
+        with pytest.raises(kering.MisregistryError):
+            regeventing._validateUpdate(stray, regid=ripper.said)
+
+        # wrong prior
+        _, crooked = makeUpdate(ripper.said, acdc.said, acdc.said, 'issued',
+                                sn=1, stamp=STAMP1)
+        with pytest.raises(kering.MisdigestError):
+            regeventing._validateUpdate(crooked, regid=ripper.said,
+                                        prior=ripper.said)
+
+
 # ---------------------------------------------------------------------------
 # Anchors (the seal-anchored verification core)
 # ---------------------------------------------------------------------------
@@ -277,6 +318,49 @@ def test_V8_unanchored_update_retryable():
         anchor(hab, bup)
         rec = vet(rip=ripper, updates=[bup], db=hby.db, blinder=blinder)
         assert rec.state == 'issued'
+
+
+def test_shared_anchor_couple_verifier_matches_local_and_verifier_policies():
+    """The shared anchor-couple verifier drives local commit while verifier-side still treats missing anchors as retryable."""
+    with openIssuer("shared-anchor-couple") as (hby, hab):
+        rgy = Regery(hby=hby, name="shared-anchor-couple", temp=True)
+        try:
+            registry = Registry(hab=hab, store=rgy.store, name="shared-anchor-couple")
+
+            # Setup registry and anchor the rip event
+            ripper = registry.make(stamp=STAMP0)
+            seal = dict(i=ripper.said, s=ripper.sad['n'], d=ripper.said)
+            hab.interact(data=[seal], framed=True, gvrsn=Vrsn_2_0)
+            assert registry.anchorMsg(ripper.said) is True
+
+            # Stage a valid update without its KEL anchor so the local path
+            # must escrow it in maes rather than accept it immediately.
+            acdc = makeAcdc(hab, regid=registry.regk)
+            blinder, bup = makeUpdate(registry.regk, ripper.said, acdc.said,
+                                      'issued', sn=1, stamp=STAMP1)
+            assert registry.processEvent(bup) is False
+            assert rgy.store.baser.maes.get(keys=registry.regk, on=1) == [(bup.said,)]
+
+            # The verifier-side policy is stricter: the same missing anchor is
+            # still a retryable failure, not an escrowed local state.
+            with pytest.raises(kering.MissingAnchorError):
+                vet(rip=ripper, updates=[bup], db=hby.db, blinder=blinder)
+
+            # Once the issuer does anchor the update, both paths should rely on
+            # the same explicit anchor-couple verifier for the KEL event.
+            seal = dict(i=registry.regk, s=bup.sad['n'], d=bup.said)
+            hab.interact(data=[seal], framed=True, gvrsn=Vrsn_2_0)
+            number = Number(num=hab.kever.sn)
+            diger = Diger(qb64=hab.kever.serder.said)
+
+            assert regeventing._verifyAnchorCouple(bup,
+                                                   db=hby.db,
+                                                   issuer=hab.pre,
+                                                   number=number,
+                                                   diger=diger)
+            assert registry.anchorMsg(bup.said, number=number, diger=diger) is True
+        finally:
+            rgy.close()
 
 
 def test_V9_anchor_in_strangers_kel_refused():
@@ -416,6 +500,38 @@ def test_V15_acdc_rd_mismatch_refused():
             vet(rip=ripB, updates=[bupB1], db=hby.db, acdc=acdcA,
                 blinder=blindB1)
         assert 'rd' in str(ex.value)
+
+
+def test_acdc_issuer_mismatch_refused():
+    """ACDC whose issuer does not match the registry's issuer is refused."""
+    with habbing.openHby(name="v15b", temp=True, version=Vrsn_2_0) as hby:
+
+        # Build two local identifiers so the registry and the presented ACDC
+        # can intentionally disagree about who the issuer is.
+        issuer = hby.makeHab(name="issuer", version=Vrsn_2_0)
+        stranger = hby.makeHab(name="stranger", version=Vrsn_2_0)
+
+        # The registry is genuinely controlled and anchored by `issuer`.
+        ripper = makeRegistry(issuer, stamp=STAMP0)
+
+        # The presented ACDC points at that registry but falsely claims that a
+        # different issuer created the credential body.
+        acdc = acdcmap(israid=stranger.pre,
+                       regid=ripper.said,
+                       attribute=dict(d='', name="Sunspot College", level="gold"))
+
+        # Build a real blinded update whose td commits to this ACDC SAID, so
+        # the only thing wrong is the issuer mismatch.
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
+        anchor(issuer, bup)
+
+        # Verification must reject the presentation because the ACDC's `i`
+        # does not match the issuer that incepted the registry.
+        with pytest.raises(kering.MisbindingError) as ex:
+            vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc,
+                blinder=blinder)
+        assert 'issuer' in str(ex.value)
 
 
 def test_V16_rdless_acdc_oneway_binding():
@@ -607,7 +723,8 @@ if __name__ == "__main__":
     test_V12_smt_root_anchor_refused_by_name()
     test_V13_seal_reference_without_seal_retryable()
     test_V14_substitution_sibling_registry_refused()
-    test_V15_acdc_rd_mismatch_refused()
+    test_acdc_issuer_mismatch_refused()
+    test_V15b_acdc_issuer_mismatch_refused()
     test_V16_rdless_acdc_oneway_binding()
     test_V16b_blinded_head_undisclosed_binds_nothing()
     test_V18_equal_n_duplicity_both_orders()
