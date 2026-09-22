@@ -88,7 +88,8 @@ spec/spec-body.md of trustoverip/kswg-acdc-specification at commit f96ef54 (2026
 co-created sibling explains the drift hazard at length. Everything this module does that
 the published text does not pin -- the "k.s" blinding-salt path, the conveyed registry
 list, the dense batch tree's leaf and interior digests, the typed batch seal, the
-mixing and lock-step obligations -- is specified in
+disclosure of one event's blind rather than the blinding salt, the mixing and lock-step
+obligations -- is specified in
 trustoverip/kswg-acdc-specification#204, which should land at the same time as this
 example.
 
@@ -165,11 +166,12 @@ BULK_AGE_SALT = b'precregageexsalt'
 # set. Small for a readable example; a real deployment sizes M to the expected number of
 # distinct verifier contexts and pays for it in TELs (spec L2911).
 BULK_SIZE = 5
-# The states a registry's blindable update can carry, for both bulk sets. Every call site
-# below passes list(SET_STATES) rather than SET_STATES: Blinder.unblind APPENDS the empty
-# placeholder state to the list it is handed (src/keri/core/structing.py), so passing this
-# constant directly would leave '' permanently in it and quietly weaken every later
-# assertion that iterates over the states an Issuer actually uses.
+# The states a registry's blindable update can carry, for both bulk sets. Blinder.unblind
+# adds the empty placeholder state to its OWN copy of this list, and the empty SAID to its
+# own copy of the acdc list (src/keri/core/structing.py:1527-1533), so the search space a
+# Disclosee brute-forces is (len(acdcs) + 1) * (len(states) + 1): the placeholder events
+# are candidates too, which is what keeps a vacuous update indistinguishable from a real
+# one even against someone who knows every state word the Issuer uses.
 SET_STATES = ['issued', 'revoked']
 
 
@@ -247,13 +249,18 @@ class _BulkNonces:
 # Phase 1b: the batch anchoring primitive, now under a TYPED seal.
 # ===========================================================================
 # #204: an Issuer anchoring a batch of independent-registry transaction events SHOULD use
-# a TYPED seal rather than a bare Merkle-root-digest seal, so that the tree type and
-# version a Validator must assume are committed in band. KERI's typed seal carries a
-# Verser -- a protocol-and-version tag -- alongside the digest, so what a Validator reads
-# off the seal is "the tree construction defined by ACDC protocol v2.0", which is the
-# construction pinned in #204 and implemented by _BatchTree. That is a coarser type than
-# "dense versus sparse" would be, and it is what KERI offers today; the co-created
-# sibling still uses the bare SealRoot, so the two spellings sit side by side.
+# a TYPED seal rather than a bare Merkle-root-digest seal, so that a Validator reads a
+# declared type off the anchor instead of supplying an assumption. Be exact about how far
+# that reaches, because it is easy to overstate. KERI's typed seal carries a Verser, whose
+# entire value space is (proto, pvrsn, gvrsn) -- src/keri/core/coring.py:2487 -- so the
+# type it declares is "ACDC protocol v2.0" and NOT "dense rather than sparse". An Issuer
+# building the amalgamated sparse tree of spec L2918 under the same protocol version emits
+# a byte-identical `t`. The construction is pinned only transitively, by being the one
+# ACDC v2.0 defines, which #204 specifies and _BatchTree implements; committing it
+# directly would need a value space Verser does not have. What the typed seal buys over
+# the bare one is that an untyped anchor can be REFUSED rather than read as a dense-tree
+# root. The co-created sibling still uses the bare SealRoot, so the two spellings sit side
+# by side.
 BATCH_TREE_TYPE = Verser(proto=Protocols.acdc, pvrsn=Vrsn_2_0, gvrsn=Vrsn_2_0).qb64
 
 
@@ -513,10 +520,18 @@ class _RegistryPool:
         Used both for revocation (state='revoked') and for the state-PRESERVING updates
         that follow it, which are what keep the moment of revocation from being legible
         in the shape of the TEL.
+
+        Another Issuee's registry restates too, and has to: a later round that touches only
+        Alice's revoked registry among the ASSIGNED population separates assigned from
+        unassigned by traffic alone. Their blinding salt is theirs and not modeled here, so
+        those blinds come from the Issuer's side exactly as their assignment did.
         """
         acdcSaid, salt = self.assigned[i]
         sn = self.sn(i) + 1
-        blinder = Blinder.blind(acdc=acdcSaid, state=state, salt=salt, sn=sn)
+        if salt is None:
+            blinder = _blind_with(self.issuerBlind(i, sn), acdc=acdcSaid, state=state)
+        else:
+            blinder = Blinder.blind(acdc=acdcSaid, state=state, salt=salt, sn=sn)
         return self._append(i, blinder.said, stamp)
 
     def unassignedNear(self, count, exclude=(), *, label="pad"):
@@ -626,7 +641,15 @@ ROUND_STAMP = "2026-07-01T03:00:00.000000+00:00"
 ISSUE_ID_STAMP = "2026-07-01T03:00:00.000000+00:00"
 ISSUE_AGE_STAMP = "2026-07-01T03:00:00.000000+00:00"
 REVOKE_STAMP = "2026-08-01T09:00:00.000000+00:00"
-LATER_ROUND_STAMP = "2026-08-01T09:00:00.000000+00:00"
+# The batch that CARRIES the revocation spans a window rather than an instant. #204 asks an
+# Issuer to mix updates "across each registry and over time", and both halves matter: a
+# later round in which the revoked registry is the only participant, or in which every
+# event shares the revocation's datetime, dates the revocation precisely for an observer
+# who can read no state at all. So the later round has its own quota, drawn across the
+# pool and across the other residents, and its events fall at several datetimes.
+LATER_ROUND_STAMPS = ("2026-08-08T14:00:00.000000+00:00",
+                      "2026-08-19T21:00:00.000000+00:00",
+                      "2026-08-27T06:00:00.000000+00:00")
 
 
 # ===========================================================================
@@ -1041,11 +1064,11 @@ def test_precreg_pool_JSON():
     # Only the Issuer can even confirm it is a placeholder: the combination trial needs
     # the blinding factor, which for a pre-assignment event never leaves the Issuer.
     blind = pool.issuerBlind(0, pool.sn(0))
-    unblinded = Blinder.unblind(said=head.sad['b'], acdc='', states=list(SET_STATES),
+    unblinded = Blinder.unblind(said=head.sad['b'], acdc='', states=SET_STATES,
                                 uuid=blind)
     assert unblinded is not None
     assert unblinded.crew.td == '' and unblinded.crew.ts == ''
-    assert Blinder.unblind(said=head.sad['b'], acdc='', states=list(SET_STATES),
+    assert Blinder.unblind(said=head.sad['b'], acdc='', states=SET_STATES,
                            uuid=pool.issuerBlind(1, pool.sn(1))) is None
 
     # The creation batch: one typed seal over many registries' inception events. Anchoring
@@ -1110,6 +1133,16 @@ def test_precreg_conveyance_JSON():
     assert max(bulk.idIdx) - min(bulk.idIdx) > BULK_SIZE
     assert not (set(bulk.idIdx) & set(bulk.ageIdx))       # 2*M distinct registries
 
+    # The path index rendering is LOWERCASE HEX, no leading zeros -- pinned by assertion
+    # rather than left to the coincidence that indices 0-9 render identically in both
+    # bases. The published spec still says "decimal or hexadecimal" (L2799), so this is
+    # the one place a conforming implementation can silently disagree with this module and
+    # still produce well-formed ACDCs. It bites here harder than in the co-created sibling:
+    # BULK_SIZE is small, but POOL_SIZE is not, so the pool's own "p{i}" paths cross 10 for
+    # the great majority of registries and the sweep below would be probing the wrong paths.
+    assert _hx(0) == "0" and _hx(15) == "f" and _hx(16) == "10"   # no padding, lowercase
+    assert _hx(10) != "10" and any(i > 9 for i in bulk.idIdx + bulk.ageIdx)
+
     # NOT DERIVABLE, asserted rather than argued. Sweep the paths bulk issuance uses --
     # including "k.r", the co-created sibling's registry-uuid path, and "k.", the
     # aggregate blinding factor's -- against both bulk salts. None of them produces the
@@ -1166,11 +1199,11 @@ def test_precreg_conveyance_JSON():
         i = bulk.idIdx[k]
         sn = pool.sn(i)
         assert Blinder.unblind(said=pool.head(i).sad['b'], acdc=bulk.idCopies[k].said,
-                               states=list(SET_STATES),
+                               states=SET_STATES,
                                uuid=wallet.blind(k, sn)).state == 'issued'
         other = (k + 1) % BULK_SIZE
         assert Blinder.unblind(said=pool.head(i).sad['b'], acdc=bulk.idCopies[k].said,
-                               states=list(SET_STATES),
+                               states=SET_STATES,
                                uuid=wallet.blind(other, sn)) is None
 
     # The wallet cannot read its own registry's PRE-assignment history, and does not need
@@ -1178,7 +1211,7 @@ def test_precreg_conveyance_JSON():
     # This is what lets the salt arrive later than the registry does.
     firstPlaceholder = pool.chain[bulk.idIdx[0]][1]
     assert all(Blinder.unblind(said=firstPlaceholder.sad['b'],
-                               acdc=bulk.idCopies[0].said, states=list(SET_STATES),
+                               acdc=bulk.idCopies[0].said, states=SET_STATES,
                                uuid=wallet.blind(0, sn)) is None
                for sn in range(1, pool.sn(bulk.idIdx[0]) + 1))
 
@@ -1252,14 +1285,14 @@ def test_precreg_whitening_round_JSON():
     for event in (assignment, noop):
         for copy in bulk.idCopies + bulk.ageCopies:
             assert Blinder.unblind(said=event.sad['b'], acdc=copy.said,
-                                   states=list(SET_STATES), uuid=guess) is None
+                                   states=SET_STATES, uuid=guess) is None
     i0 = bulk.idIdx[0]
     assert Blinder.unblind(said=assignment.sad['b'], acdc=bulk.idCopies[0].said,
-                           states=list(SET_STATES),
+                           states=SET_STATES,
                            uuid=bulk.idWallet.blind(0, bulk.pool.sn(i0))).state == 'issued'
     padIdx = bulk.pool.byRd[noop.sad['rd']]
     padBlind = bulk.pool.issuerBlind(padIdx, bulk.pool.sn(padIdx))
-    padded = Blinder.unblind(said=noop.sad['b'], acdc='', states=list(SET_STATES),
+    padded = Blinder.unblind(said=noop.sad['b'], acdc='', states=SET_STATES,
                              uuid=padBlind)
     assert padded is not None and padded.crew.ts == ''
 
@@ -1622,13 +1655,14 @@ def _verify_issuance(copy, *, reg, event, blind, proof, sealer):
       4. the Issuer's anchoring seal commits to the event, which here means a typed seal
          of the expected tree type whose digest the inclusion proof reconstructs.
 
-    TAKES THE BLIND, NOT THE SALT. Blinder.makeUUID derives the blind from the salt with
-    the sequence number as the ENTIRE path (src/keri/core/structing.py), so a Disclosee
-    handed the salt could unblind every event in the registry, past and future, without
-    ever interacting again. That would defeat the re-blinding remedy at spec L2131 and
-    contradict spec L2133, which reserves the salt to Issuer and Discloser. So the
-    Discloser sends one event's blind, and each later state change requires a fresh
-    disclosure -- which is what Phase 6's revocation exercises.
+    The blind, not the salt, and #204 states the prohibition directly. Blinder.makeUUID
+    derives the blind from the salt with the sequence number as the ENTIRE path
+    (src/keri/core/structing.py), and that sequence number rides in the clear in every
+    `bup`, so a Disclosee handed the salt could unblind every event in the registry, past
+    and future, without ever interacting again. That would defeat the re-blinding remedy
+    at spec L2131 and contradict spec L2133, which reserves the salt to Issuer and
+    Discloser. So the Discloser sends one event's blind, and each later state change
+    requires a fresh disclosure -- which is what Phase 6's revocation exercises.
 
     Returns the state string ('issued' / 'revoked') or None if any step fails.
     """
@@ -1636,7 +1670,7 @@ def _verify_issuance(copy, *, reg, event, blind, proof, sealer):
         return None
     if reg.sad['i'] != copy.sad['i']:      # the issuer controls the registry it names
         return None
-    blinder = Blinder.unblind(said=event.sad['b'], acdc=copy.said, states=list(SET_STATES),
+    blinder = Blinder.unblind(said=event.sad['b'], acdc=copy.said, states=SET_STATES,
                               uuid=blind)
     if blinder is None:
         return None
@@ -1755,7 +1789,7 @@ def test_precreg_disclosure_gating_and_revocation_JSON():
     assert granted['e']['age']['n'] == bulk.ageCopies[k].said
     bundle = grant.sad['a']['issuance']
     assert bundle['rip']['d'] == pool.rd(i) and bundle['rip']['i'] == STATE
-    assert bundle['seal']['t'] == BATCH_TREE_TYPE               # typed seal, in band
+    assert bundle['seal']['t'] == BATCH_TREE_TYPE               # typed anchor, not bare
     assert _verify_issuance(bulk.ageCopies[k], reg=pool.regs[i],
                             event=bulk.ageIssues[k], blind=bundle['blind'],
                             proof=bulk.tree.prove(bulk.ageIssues[k].said),
@@ -1806,10 +1840,15 @@ def test_precreg_disclosure_gating_and_revocation_JSON():
                             event=bulk.ageIssues[k], blind=bundle['blind'],
                             proof=strayTree.prove(bulk.padding[0].said),
                             sealer=bulk.sealer) is None
-    # ...and a BARE Merkle-root seal is refused rather than assumed, which is what makes
-    # the typed seal load-bearing instead of decorative: a Validator holding a root digest
-    # alone cannot tell a dense batch tree from the amalgamated sparse tree spec L2918
-    # describes, and #204 therefore has the Issuer commit the construction in band.
+    # ...and a BARE Merkle-root seal is refused rather than assumed. A Validator holding a
+    # root digest alone cannot tell a dense batch tree from the amalgamated sparse tree
+    # spec L2918 describes, so #204 has the Issuer type the anchor. Note the limit of what
+    # the type can say: SealKind's `t` is a Verser, which encodes (proto, pvrsn, gvrsn) and
+    # nothing else (src/keri/core/coring.py:2487), so a sparse-tree Issuer under ACDC v2.0
+    # emits this exact `t`. The construction is pinned only transitively, by being the one
+    # ACDC v2.0 defines. What this assertion proves is the narrower and still worthwhile
+    # thing: an untyped anchor is refused, so a Validator never silently supplies a
+    # construction the Issuer never named.
     bareSealer = Sealer(crew=SealRoot(rd=bulk.tree.root))
     assert _verify_issuance(bulk.ageCopies[k], reg=pool.regs[i],
                             event=bulk.ageIssues[k], blind=bundle['blind'],
@@ -1826,13 +1865,43 @@ def test_precreg_disclosure_gating_and_revocation_JSON():
     # guardianship example says it does not do: without them, a registry that stops
     # emitting events at the moment of revocation dates the revocation for any observer,
     # even one who can read no state at all.
-    quiet = [pool.restate(i, 'revoked', LATER_ROUND_STAMP) for _ in range(2)]
+    quiet = [pool.restate(i, 'revoked', LATER_ROUND_STAMPS[n]) for n in range(2)]
     assert pool.sn(i) == revokeSn + 2
     assert len({e.sad['b'] for e in [revoked] + quiet}) == 3      # each re-blinded afresh
+
+    # ...and the rest of the round, which is the half that does the work. The revoked
+    # registry is one participant among a full quota: other residents' ASSIGNED registries
+    # restate (state-preserving, so nothing about them changed), and unassigned registries
+    # take fresh placeholders. Reusing the issuance round's padding here would anchor the
+    # same events twice and leave the revoked registry the only object in the pool with any
+    # traffic after the issuance -- the failure the quiet updates exist to prevent.
+    laterOthers = [pool.restate(x, 'issued', LATER_ROUND_STAMPS[n % 3])
+                   for n, x in enumerate(bulk.otherIdx)]
+    laterPad = [pool.placeholder(x, LATER_ROUND_STAMPS[n % 3])
+                for n, x in enumerate(pool.unassignedNear(
+                    WHITEN_QUOTA - 3 - len(laterOthers),
+                    exclude=bulk.idIdx + bulk.ageIdx, label="later"))]
     laterTree, laterSealer = _anchor([revoked.said], [e.said for e in quiet],
-                                     [e.said for e in bulk.padding])
+                                     [e.said for e in laterOthers],
+                                     [e.said for e in laterPad])
     for event in [revoked] + quiet:
         assert _verify_anchored(event.said, laterTree, laterSealer)
+
+    # The negative control for claim 6, stated over the pool rather than over this one
+    # registry. After the issuance round, traffic is not concentrated on the credential
+    # that died: a full quota of registries emits, the assigned population is represented
+    # among them, and the events do not share a datetime. Each of those three, violated
+    # alone, hands a third party the revocation date.
+    def _after(x):
+        return [e for e in pool.chain[x][1:] if e.sad['dt'] > ROUND_STAMP]
+
+    moved = [x for x in range(pool.size) if _after(x)]
+    stirred = [e for x in moved for e in _after(x)]
+    assert i in moved
+    assert len(stirred) == WHITEN_QUOTA                    # a full round, not a trickle
+    assert len(moved) > WHITEN_QUOTA / 2                   # spread across registries
+    assert set(bulk.otherIdx) <= set(moved)                # assigned registries move too
+    assert len({e.sad['dt'] for e in stirred}) > 1         # and spread over time
 
     # The verifier cannot follow the registry on its own: the blind it was given covers
     # the assignment event only, so reading any later event needs a FRESH disclosure. That
