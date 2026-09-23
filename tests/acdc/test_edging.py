@@ -789,3 +789,16 @@ def test_an_emancipation_rests_on_the_guardianship_no_longer_standing():
     assert verify(freed, guardian, bobCitizen,
                   standing=revoked).verdict == Verdicts.valid
     assert verify(freed).verdict == Verdicts.unknown
+
+
+@pytest.mark.parametrize("kind", ["CBOR", "MGPK"])
+def test_a_pin_judges_a_non_json_far_node_on_its_fields(kind):
+    """Schemer.verify reads JSON only, so a pin handed a CBOR or MGPK far node's wire
+    bytes failed as undecodable. The pin judges the fields the SAID committed to."""
+    far = acdcmap(israid=SUE, schema=CORE_SCHEMA.said,
+                  attribute=dict(d='', i=GUY, legalName="x"), kind=kind)
+    near = acdc(GUY, edge=edge(far, schema=CORE_SCHEMA.said))
+    assert verify(near, far).verdict == Verdicts.valid
+    wrong = acdc(GUY, edge=edge(far, schema=UTAH_AGENT_SCHEMA.said))
+    verdict = verify(wrong, far)
+    assert verdict.verdict == Verdicts.invalid and "utf-8" not in verdict.reason
