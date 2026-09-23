@@ -109,9 +109,38 @@ def checkUrl(url, *, blockPrivate=None):
     if purl.scheme not in ALLOWED_URL_SCHEMES:
         raise ValidationError(f"Invalid URL scheme {purl.scheme!r}; only "
                               f"{ALLOWED_URL_SCHEMES} are fetched. url={url!r}")
-    host = purl.hostname
-    if not host:
+    if not purl.hostname:
         raise ValidationError(f"URL {url!r} has no host.")
+
+    checkHost(purl.hostname, purl.port, blockPrivate=blockPrivate, url=url)
+    return purl
+
+
+def checkHost(host, port=None, *, blockPrivate=None, url=None):
+    """The address half of the address policy, with no opinion about scheme.
+
+    Kept separate from :func:`checkUrl` because the policy is about where a
+    connection lands, not about which protocol carries it. checkUrl owns the
+    http/https allow-list and calls this; a transport that is not HTTP — the TCP
+    witness messengers in app.agenting — calls this directly, after its own
+    scheme check. Before the split there was no way to reuse the address policy
+    without also asserting the URL was fetchable over HTTP, so the TCP paths
+    enforced nothing and the witness chose which of the two keripy used.
+
+    Parameters:
+        host (str): hostname or literal IP the connection will be made to.
+        port (int|None): port, used only to steer address resolution.
+        blockPrivate (bool|None): opt-in to also block private ranges; None uses
+            the module default BLOCK_PRIVATE_ADDRESSES.
+        url (str|None): the full URL, quoted in the error when there is one.
+
+    Raises:
+        kering.ValidationError: if the host is a blocked destination.
+    """
+    if blockPrivate is None:
+        blockPrivate = BLOCK_PRIVATE_ADDRESSES
+
+    where = f" url={url!r}" if url is not None else ""
 
     try:  # literal IP address?
         ip = ipaddress.ip_address(host)
@@ -120,15 +149,15 @@ def checkUrl(url, *, blockPrivate=None):
 
     if ip is not None:
         if _addressBlocked(ip, blockPrivate):
-            raise ValidationError(f"URL host {host} is a blocked non-public "
-                                  f"address; refusing to fetch (address policy). url={url!r}")
-        return purl
+            raise ValidationError(f"Host {host} is a blocked non-public "
+                                  f"address; refusing to connect (address policy).{where}")
+        return
 
     # a hostname (which may be a decimal/hex/octal-encoded IP): block if it
-    # resolves to a blocked address; if it cannot be resolved, let the fetch
+    # resolves to a blocked address; if it cannot be resolved, let the connection
     # itself fail rather than false-positive here.
     try:
-        infos = socket.getaddrinfo(host, purl.port, proto=socket.IPPROTO_TCP)
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
     except OSError:
         infos = []
     for info in infos:
@@ -137,10 +166,9 @@ def checkUrl(url, *, blockPrivate=None):
         except ValueError:
             continue
         if _addressBlocked(rip, blockPrivate):
-            raise ValidationError(f"URL host {host} resolves to blocked "
-                                  f"non-public address {rip}; refusing to fetch "
-                                  f"(address policy). url={url!r}")
-    return purl
+            raise ValidationError(f"Host {host} resolves to blocked "
+                                  f"non-public address {rip}; refusing to connect "
+                                  f"(address policy).{where}")
 
 
 #: Default maximum number of HTTP redirects keripy will follow. redirectable=False
