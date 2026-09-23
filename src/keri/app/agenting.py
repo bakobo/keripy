@@ -13,7 +13,7 @@ from hio.help import decking, Hict, ogler
 
 from socket import gaierror
 
-from .httping import (Clienter, streamCESRRequests, checkUrl, boundedResponseBody,
+from .httping import (Clienter, streamCESRRequests, checkUrl, checkHost, boundedResponseBody,
                       RedirectGuardedClient, CESR_DESTINATION_HEADER)
 
 from ..kering import (Schemes, Roles, ValidationError,
@@ -705,6 +705,13 @@ class TCPMessenger(doing.DoDoer):
             url (str): tcp endpoint URL for the witness.
             msgs (Deck | None): outbound message queue.
             sent (Deck | None): sent message queue."""
+        # address policy, same policy the HTTP messengers apply (raises
+        # kering.ValidationError). Checked here rather than in receiptDo so a
+        # blocked witness fails where the caller can see it, and before the
+        # Doist owns the failure.
+        up = urlparse(url)
+        checkHost(up.hostname, up.port, url=url)
+
         self.hab = hab
         self.wit = wit
         self.url = url
@@ -776,6 +783,10 @@ class TCPStreamMessenger(doing.DoDoer):
             url (str): tcp endpoint URL for the witness.
             msgs (Deck | None): outbound message queue.
             sent (Deck | None): sent message queue."""
+        # address policy, as in TCPMessenger (raises kering.ValidationError).
+        up = urlparse(url)
+        checkHost(up.hostname, up.port, url=url)
+
         self.hab = hab
         self.wit = wit
         self.url = url
