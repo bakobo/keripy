@@ -204,3 +204,57 @@ def test_http_client_uses_guarded_client(monkeypatch):
     agenting.httpClient(FakeHab(), "EWit")
     assert built["hostname"] == "8.8.8.8"
     assert built.get("redirectable", True) is not False
+
+
+# --- the address policy is transport-independent -------------------
+#
+# checkUrl couples two policies: a scheme allow-list (http/https) and the
+# blocked-address check. The TCP witness transports could not reuse it, because
+# the scheme line refuses every tcp:// URL before the address logic runs -- so
+# they had no address check at all, while their HTTP siblings did. The witness
+# URL comes from the same /loc/scheme record either way, and which transport is
+# used is the witness's choice, so the peer picked the unguarded path.
+
+def test_checkHost_enforces_the_address_policy_without_a_scheme():
+    """The address half, usable by any transport."""
+    with pytest.raises(ValidationError):
+        httping.checkHost("169.254.169.254")
+    with pytest.raises(ValidationError):
+        httping.checkHost("0xA9FEA9FE")           # hex-encoded metadata
+    httping.checkHost("127.0.0.1", 5631)          # loopback stays allowed
+    httping.checkHost("8.8.8.8", 5631)
+    httping.checkHost("10.1.2.3")                 # private allowed by default
+    with pytest.raises(ValidationError):
+        httping.checkHost("10.1.2.3", blockPrivate=True)
+
+
+def test_checkUrl_still_owns_the_scheme_allow_list():
+    """The split must not widen checkUrl: a tcp:// URL is still not fetchable
+    over HTTP, which is what made the guard unusable from the TCP path."""
+    with pytest.raises(ValidationError):
+        httping.checkUrl("tcp://8.8.8.8:5631")
+    assert httping.checkUrl("http://8.8.8.8/oobi").hostname == "8.8.8.8"
+
+
+def test_tcp_messenger_blocks_metadata():
+    from keri.app.agenting import TCPMessenger
+    with pytest.raises(ValidationError):
+        TCPMessenger(hab=None, wit="EWit", url="tcp://169.254.169.254:5631")
+
+
+def test_tcp_stream_messenger_blocks_metadata():
+    from keri.app.agenting import TCPStreamMessenger
+    with pytest.raises(ValidationError):
+        TCPStreamMessenger(hab=None, wit="EWit", url="tcp://169.254.169.254:5631")
+
+
+def test_tcp_messengers_accept_an_ordinary_witness():
+    """The false-positive direction, which matters more than the block: a normal
+    tcp:// witness on loopback still builds."""
+    from keri.app import habbing
+    from keri.app.agenting import TCPMessenger, TCPStreamMessenger
+
+    with habbing.openHab(name="addr-tcp", temp=True) as (hby, hab):
+        assert TCPMessenger(hab=hab, wit="EWit", url="tcp://127.0.0.1:5631") is not None
+        assert TCPStreamMessenger(hab=hab, wit="EWit",
+                                  url="tcp://127.0.0.1:5631") is not None
