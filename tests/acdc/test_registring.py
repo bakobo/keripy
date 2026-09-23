@@ -776,6 +776,84 @@ def test_rever_refusals():
         assert reger.tels.get(keys=regid, on=1).qb64 == upd1.said  # unmoved
 
 
+# ---------------------------------------------------------------------------
+# Union with upstream's shared TEL kernel
+#
+# Upstream (WebOfTrust/keripy#1643) grew an issuer-side engine and a shared
+# validation kernel in this same module, restricted to rip + bup and with an
+# issuer-bound vetBindings.  This fork's verifier core also accepts upd.  The
+# union keeps each side's scope: the verifier accepts the wider grammar, the
+# issuer-side engine keeps upstream's narrower one, and the issuer binding
+# applies on every verifier path.
+# ---------------------------------------------------------------------------
+
+FOREIGN = "EAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+
+def test_union_issuer_kernel_keeps_bup_only():
+    """The shared kernel's default grammar stays upstream's (rip + bup), so
+    the issuer-side engine never admits an upd; the verifier opts in to upd
+    explicitly and only there."""
+    with openIssuer("union-kernel") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        acdc = makeAcdc(hab, regid=ripper.said)
+        upd = update(regid=ripper.said, prior=ripper.said, acdc=acdc.said,
+                     state='issued', sn=1, stamp=STAMP1)
+
+        with pytest.raises(kering.ValidationError):
+            registring._normalizeEventRecord(upd)
+        with pytest.raises(kering.ValidationError):
+            registring._validateUpdate(upd, regid=ripper.said)
+
+        event = registring._validateUpdate(upd, regid=ripper.said,
+                                           prior=ripper.said,
+                                           ilks=(Ilks.bup, Ilks.upd))
+        assert event.ilk == Ilks.upd
+        assert event.regk == ripper.said
+        assert event.prior == ripper.said
+        assert registring.vetUpdate(upd, ripper).said == upd.said
+
+        # a rip is never an update, whatever grammar the caller admits
+        with pytest.raises(kering.ValidationError):
+            registring._validateUpdate(ripper, regid=ripper.said,
+                                       ilks=(Ilks.bup, Ilks.upd))
+
+
+def test_union_upd_head_binds_issuer():
+    """An upd head that genuinely commits td = the presented ACDC is still
+    refused when the ACDC names an issuer other than the registry's."""
+    with openIssuer("union-upd-issuer") as (hby, hab):
+        ripper = makeRegistry(hab)
+        forged = acdcmap(israid=FOREIGN, regid=ripper.said,
+                         attribute=dict(d='', name="Sunspot College",
+                                        level="gold"))
+        upd = update(regid=ripper.said, prior=ripper.said, acdc=forged.said,
+                     state='issued', sn=1, stamp=STAMP1)
+        anchor(hab, upd)
+
+        assert vet(rip=ripper, updates=[upd], db=hby.db).acdc == forged.said
+        with pytest.raises(kering.MisbindingError) as ex:
+            vet(rip=ripper, updates=[upd], db=hby.db, acdc=forged)
+        assert 'issuer' in str(ex.value)
+
+
+def test_union_vetregistries_binds_issuer():
+    """vetRegistries applies the same issuer binding as vet: a registry that
+    commits the ACDC does not bless it when the ACDC names another issuer."""
+    with openIssuer("union-vetregs-issuer") as (hby, hab):
+        forged = acdcmap(israid=FOREIGN, regid=None,
+                         attribute=dict(d='', name="Sunspot College",
+                                        level="gold"))
+        ripper = makeRegistry(hab)
+        upd = update(regid=ripper.said, prior=ripper.said, acdc=forged.said,
+                     state='issued', sn=1, stamp=STAMP1)
+        anchor(hab, upd)
+
+        with pytest.raises(kering.MisbindingError):
+            vetRegistries(acdc=forged, evidences=[(ripper, [upd])],
+                          db=hby.db)
+
+
 if __name__ == "__main__":
     test_V1_rip_upd_issued_verifies()
     test_V2_revoking_upd_state_revoked()
@@ -805,3 +883,6 @@ if __name__ == "__main__":
     test_rever_missing_anchor_escrow_and_drain()
     test_rever_out_of_order_escrow_and_drain()
     test_rever_refusals()
+    test_union_issuer_kernel_keeps_bup_only()
+    test_union_upd_head_binds_issuer()
+    test_union_vetregistries_binds_issuer()
