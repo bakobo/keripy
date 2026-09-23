@@ -673,3 +673,119 @@ def test_registry_evidence_that_does_not_parse_does_not_stand():
         far = acdcmap(israid=hab.pre, attribute=dict(d='', name="x"))
         verdict = edging.registryStanding(far, b"not a registry event", [], db=hby.db)
         assert verdict.verdict == Verdicts.invalid
+
+
+# ---------------------------------------------------------------------------
+# Guardianship and ward-authorization shapes
+#
+# Modelled on tests/acdc/test_guardianship_presentation.py and
+# tests/acdc/test_ward_authz_presentation.py: a guardian (Bob) holds a credential
+# naming the ward by edge, a ward's own credential declares the encumbrance by an
+# NI2I edge, the guardian issues the ward an authorization with I2I and E1E edges,
+# and the ward presents through a bespoke origin with an I2I edge.
+# ---------------------------------------------------------------------------
+
+STATE, BOB, CARA, SOCIAL = UTAH, PAT, EVE, GAL
+
+
+def ward():
+    """(1)-(5) of test_ward_authz_presentation.py, with the same five edges."""
+    bobCitizen = acdc(STATE, issuee=BOB, uuid='a1' + 'A' * 42)
+    guardian = acdc(STATE, issuee=BOB, uuid='a2' + 'A' * 42,
+                    edge=dict(d='', u='', citizen=dict(d='', u='', n=bobCitizen.said,
+                                                       s=CORE_SCHEMA.said, o='E1E')))
+    caraCitizen = acdc(STATE, issuee=CARA, uuid='a3' + 'A' * 42,
+                       edge=dict(d='', u='', guardian=dict(d='', u='', n=guardian.said,
+                                                           s=CORE_SCHEMA.said, o='NI2I')))
+    authz = acdc(BOB, issuee=CARA, uuid='a4' + 'A' * 42,
+                 edge=dict(d='', u='',
+                           authority=dict(d='', u='', n=guardian.said,
+                                          s=CORE_SCHEMA.said, o='I2I'),
+                           subject=dict(d='', u='', n=caraCitizen.said,
+                                        s=CORE_SCHEMA.said, o='E1E')))
+    presentation = acdc(CARA, issuee=SOCIAL, uuid='a5' + 'A' * 42,
+                        edge=dict(d='', u='', authz=dict(d='', u='', n=authz.said,
+                                                         s=CORE_SCHEMA.said, o='I2I')))
+    return bobCitizen, guardian, caraCitizen, authz, presentation
+
+
+def test_a_ward_presentation_verifies_over_the_whole_authorization_graph():
+    bobCitizen, guardian, caraCitizen, authz, presentation = ward()
+    standing = Standing()
+    verdict = verify(presentation, bobCitizen, guardian, caraCitizen, authz,
+                     standing=standing)
+    assert verdict.verdict == Verdicts.valid
+    # The guardian credential is reached by two paths and judged once.
+    assert sorted(standing.asked) == sorted([authz.said, guardian.said,
+                                             bobCitizen.said, caraCitizen.said])
+
+
+def test_a_ward_authorization_from_somebody_who_is_not_the_guardian_is_refused():
+    """authority is I2I: the authorization's issuer must be the guardian credential's
+    issuee. Issued by the State instead, it fails."""
+    bobCitizen, guardian, caraCitizen, _, _ = ward()
+    forged = acdc(STATE, issuee=CARA,
+                  edge=dict(d='', authority=dict(n=guardian.said, o='I2I'),
+                            subject=dict(n=caraCitizen.said, o='E1E')))
+    verdict = verify(forged, bobCitizen, guardian, caraCitizen)
+    assert verdict.verdict == Verdicts.invalid and "I2I" in verdict.reason
+
+
+def test_a_ward_authorization_for_a_different_ward_is_refused():
+    """subject is E1E: the authorization's issuee must be the ward citizen's issuee."""
+    bobCitizen, guardian, caraCitizen, _, _ = ward()
+    other = acdc(BOB, issuee=SOCIAL,
+                 edge=dict(d='', authority=dict(n=guardian.said, o='I2I'),
+                           subject=dict(n=caraCitizen.said, o='E1E')))
+    verdict = verify(other, bobCitizen, guardian, caraCitizen)
+    assert verdict.verdict == Verdicts.invalid and "E1E" in verdict.reason
+
+
+def test_a_revoked_guardianship_refuses_the_ward_presentation():
+    bobCitizen, guardian, caraCitizen, authz, presentation = ward()
+    standing = Standing(**{guardian.said: chaining.invalid("revoked")})
+    assert verify(presentation, bobCitizen, guardian, caraCitizen, authz,
+                  standing=standing).verdict == Verdicts.invalid
+
+
+def test_a_guardian_presentation_rests_on_i2i_authority_and_ni2i_references():
+    """test_guardianship_presentation.py's shape: the guardian credential names the ward
+    by an NI2I subject edge and an NI2I authorization edge; the guardian's presentation
+    carries authority (I2I) to it and wardId/wardAge (NI2I) to the ward's credentials;
+    the ward's age credential binds to her identity by E1E."""
+    MIA, DGO, ENDORSER, STORE, REGISTRAR = EVE, UTAH, SUE, GAL, GUY
+    sediId = acdc(DGO, issuee=MIA, uuid='b1' + 'A' * 42)
+    age = acdc(ENDORSER, issuee=MIA, uuid='b2' + 'A' * 42,
+               edge=dict(d='', identity=dict(n=sediId.said, o='E1E')))
+    birthCert = acdc(REGISTRAR, uuid='b3' + 'A' * 42)
+    guardian = acdc(DGO, issuee=BOB, uuid='b4' + 'A' * 42,
+                    edge=dict(d='', subject=dict(n=sediId.said, o='NI2I'),
+                              authorization=dict(n=birthCert.said, o='NI2I')))
+    presentation = acdc(BOB, issuee=STORE, uuid='b5' + 'A' * 42,
+                        edge=dict(d='', authority=dict(n=guardian.said, o='I2I'),
+                                  wardId=dict(n=sediId.said, o='NI2I'),
+                                  wardAge=dict(n=age.said, o='NI2I')))
+    presented = (sediId, age, birthCert, guardian)
+    assert verify(presentation, *presented).verdict == Verdicts.valid
+    # Mia presenting in Bob's place fails the I2I authority edge.
+    impersonation = acdc(MIA, issuee=STORE, uuid='b6' + 'A' * 42,
+                         edge=dict(d='', authority=dict(n=guardian.said, o='I2I')))
+    assert verify(impersonation, *presented).verdict == Verdicts.invalid
+    # The age credential rests on Mia's identity; an age issued to Bob does not.
+    wrongAge = acdc(ENDORSER, issuee=BOB, uuid='b7' + 'A' * 42,
+                    edge=dict(d='', identity=dict(n=sediId.said, o='E1E')))
+    assert verify(wrongAge, sediId).verdict == Verdicts.invalid
+
+
+def test_an_emancipation_rests_on_the_guardianship_no_longer_standing():
+    """NOT in a ward-shaped graph: a credential that holds only while the guardianship
+    it names does NOT stand -- valid once the guardianship is revoked, refused while it
+    stands, and undecided when it is withheld."""
+    bobCitizen, guardian, _, _, _ = ward()
+    freed = acdc(STATE, issuee=CARA,
+                 edge=dict(d='', former=dict(n=guardian.said, o=['NOT', 'NI2I'])))
+    assert verify(freed, guardian, bobCitizen).verdict == Verdicts.invalid
+    revoked = Standing(**{guardian.said: chaining.invalid("revoked")})
+    assert verify(freed, guardian, bobCitizen,
+                  standing=revoked).verdict == Verdicts.valid
+    assert verify(freed).verdict == Verdicts.unknown
