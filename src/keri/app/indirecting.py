@@ -97,7 +97,7 @@ def setupWitness(hby, alias="witness", mbx=None, aids=None, tcpPort=5631, httpPo
                             rvy=rvy,
                             version=parser_version)
 
-    httpEnd = HttpEnd(rxbs=parser.ims, mbx=mbx)
+    httpEnd = HttpEnd(rxbs=parser.ims, mbx=mbx, parser=parser)
     app.add_route("/", httpEnd)
     receiptEnd = ReceiptEnd(hab=hab, inbound=cues, aids=aids, version=parser_version)
     app.add_route("/receipts", receiptEnd)
@@ -854,7 +854,7 @@ class HttpEnd:
     TimeoutQNF = 30
     TimeoutMBX = 5
 
-    def __init__(self, rxbs=None, mbx=None, qrycues=None):
+    def __init__(self, rxbs=None, mbx=None, qrycues=None, parser=None):
         """
         Create the KEL HTTP server from the Habitat with an optional Falcon App to
         register the routes with.
@@ -862,11 +862,40 @@ class HttpEnd:
         Parameters
              rxbs (bytearray): output queue of bytes for message processing
              mbx (Mailboxer): Mailbox storage
-             qrycues (Deck): inbound qry response queues"""
+             qrycues (Deck): inbound qry response queues
+             parser (Parser|None): when provided, each request body is parsed
+                on its own as one frame, routed to this parser's message
+                handlers, instead of being appended to rxbs. One request's
+                attachments then cannot change how another request is parsed."""
         self.rxbs = rxbs if rxbs is not None else bytearray()
+        self.parser = parser
+        self.version = parser.version if parser is not None else None
 
         self.mbx = mbx
         self.qrycues = qrycues if qrycues is not None else decking.Deck()
+
+    def ingest(self, msg):
+        """Parse msg, the bytes of one request, as its own frame
+
+        A fresh Parser per request means neither a counter's declared size nor
+        a version change in one request can reach into the next. The handlers
+        are the shared ones, so processing is the same as for .rxbs.
+
+        Parameters:
+            msg (bytearray): message plus attachments from one request
+        """
+        if self.parser is None:
+            self.rxbs.extend(msg)
+            return
+
+        psr = parsing.Parser(framed=True,
+                             kvy=self.parser.kvy,
+                             tvy=self.parser.tvy,
+                             exc=self.parser.exc,
+                             rvy=self.parser.rvy,
+                             vry=self.parser.vry,
+                             version=self.version)
+        psr.parse(ims=bytearray(msg), local=True)
 
     def on_post(self, req, rep):
         """
@@ -907,7 +936,7 @@ class HttpEnd:
         msg = bytearray(serder.raw)
         msg.extend(cr.attachments.encode("utf-8"))
 
-        self.rxbs.extend(msg)
+        self.ingest(msg)
 
         if serder.proto in ("ACDC",):
             rep.set_header('Content-Type', "application/json")
@@ -964,7 +993,7 @@ class HttpEnd:
         rep.set_header('connection', "close")
 
         # Bound the mailbox PUT body before reading it.
-        self.rxbs.extend(readBoundedBody(req))
+        self.ingest(readBoundedBody(req))
 
         rep.set_header('Content-Type', "application/json")
         rep.status = falcon.HTTP_204
