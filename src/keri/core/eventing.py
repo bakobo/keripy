@@ -359,6 +359,36 @@ def verifySigs(raw, sigers, verfers):
     return (vsigers, vindices)
 
 
+def exposeds(sigers, ndigers):
+    """
+    Returns list of ondices (indices) suitable for Tholder.satisfy from
+    ndigers (prior next key digests) as exposed by verified sigers on a
+    rotation. Uses the dual index feature of siger. Assumes that each
+    siger.verfer is from the correct key given by siger.index and the
+    signature has been verified.
+
+    Only ondices whose digest in ndigers matches the digest of the siger's
+    key, computed with that digest's code, are returned.
+
+    Parameters:
+        sigers (list): of verified Siger instances with .verfer assigned
+        ndigers (list): of Diger instances of prior next key digests"""
+    odxs = []
+    for siger in sigers:
+        try:
+            diger = ndigers[siger.ondex]
+        except TypeError as ex:  # ondex may be None
+            continue
+        except IndexError as ex:
+            continue
+
+        kdig = Diger(ser=siger.verfer.qb64b, code=diger.code).qb64
+        if kdig == diger.qb64:
+            odxs.append(siger.ondex)
+
+    return odxs
+
+
 def validateSigs(serder, sigers, verfers, tholder):
     """
     Validates signatures given by sigers using keys given by verfers on msg
@@ -2938,22 +2968,7 @@ class Kever:
 
         Parameters:
             sigers (list): of Siger instances  of indexed signature with .verfer"""
-        odxs = []
-        for siger in sigers:
-            try:
-                diger = self.ndigers[siger.ondex]
-            except TypeError as ex:  # ondex may be None
-                continue
-            except IndexError as ex:
-                continue
-                #raise ValidationError(f'Invalid ondex={siger.ondex} '
-                                      #f'to expose digest.') from ex
-
-            kdig = Diger(ser=siger.verfer.qb64b, code=diger.code).qb64
-            if kdig == diger.qb64:
-                odxs.append(siger.ondex)
-
-        return odxs
+        return exposeds(sigers, self.ndigers)
 
 
     def validateDelegation(self, serder, sigers, wigers, wits, delpre, *,
@@ -4320,6 +4335,8 @@ class Kevery:
                         kever.logEvent(serder, sigers=sigers, wigers=wigers)
 
                 else:  # escrow likely duplicitous event
+                    # raises ValidationError so drops event if no verified sig
+                    sigers = self.validateLDSigs(serder=serder, sigers=sigers)
                     self.escrowLDEvent(serder=serder, sigers=sigers)
                     msg = f"Likely Duplicitous Event sn={serder.sn} type={serder.ilk} SAID={serder.said}"
                     logger.debug(msg)
@@ -4405,6 +4422,8 @@ class Kevery:
                             kever.logEvent(serder, sigers=sigers, wigers=wigers)  # idempotent update db logs
 
                     else:  # escrow likely duplicitous event
+                        # raises ValidationError so drops event if no verified sig
+                        sigers = self.validateLDSigs(serder=serder, sigers=sigers)
                         self.escrowLDEvent(serder=serder, sigers=sigers)
                         msg = f"Likely Duplicitous Event sn={serder.sn} type={serder.ilk} SAID={serder.said}"
                         logger.debug(msg)
@@ -5609,6 +5628,53 @@ class Kevery:
             logger.info(msg)
             logger.debug("Query Body=\n%s\n", serder.pretty())
             raise ValidationError(msg)
+
+
+    def validateLDSigs(self, serder, sigers):
+        """
+        Returns list of verified controller sigers on likely duplicitous event
+        serder, that is, an event that conflicts with an event already accepted
+        into the KEL at the same sn. Does not change key state.
+
+        Raises ValidationError when no siger verifies, so that the caller drops
+        the event instead of escrowing it.
+
+        The keys that must sign depend on the event's ilk:
+            icp, dip: the event's own keys. A different inception can share an
+                accepted prefix only when the prefix is basic, and SerderKERI
+                requires a basic prefix to be the event's single key.
+            ixn: the keys of the latest establishment event before sn.
+            rot, drt: the event's own keys, each of which must also be exposed
+                by the prior next key digests of the latest establishment event
+                before sn. Otherwise anyone could sign a rotation with fresh keys.
+
+        Parameters:
+            serder (SerderKERI): instance of likely duplicitous event
+            sigers (list[Siger]): instances of attached controller indexed sigs"""
+        ilk = serder.ilk
+        ndigers = None
+        if ilk in (Ilks.icp, Ilks.dip):
+            verfers = serder.verfers
+        else:
+            eserder = (self.fetchEstEvent(serder.pre, serder.sn - 1)
+                       if serder.sn > 0 else None)
+            if eserder is None:
+                raise ValidationError(f"Missing prior establishment event for "
+                                      f"likely duplicitous evt = {serder.said}.")
+            if ilk in (Ilks.rot, Ilks.drt):
+                verfers = serder.verfers
+                ndigers = eserder.ndigers
+            else:
+                verfers = eserder.verfers
+
+        sigers, indices = verifySigs(raw=serder.raw, sigers=sigers, verfers=verfers)
+        if ndigers is not None:  # keep only sigs by keys the prior next commits to
+            sigers = [siger for siger in sigers if exposeds([siger], ndigers)]
+
+        if not sigers:
+            raise ValidationError(f"No verified controller signatures for likely"
+                                  f" duplicitous evt = {serder.said}.")
+        return sigers
 
 
     def fetchEstEvent(self, pre, sn):
