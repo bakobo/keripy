@@ -3,8 +3,8 @@
 tests.acdc.test_bulk_issuance_shared_registry module
 
 Worked, working example of BASIC bulk-issued private ACDCs -- the SHARED-REGISTRY
-form (ACDC, Bulk-issued Private ACDCs > Basic Bulk Issuance
-Procedure): all M copies of a set share ONE registry, and one blinded
+form (ACDC, Bulk-issued Private ACDCs > Basic Bulk Issuance Procedure): all M
+copies of a set share ONE registry, and one blinded
 aggregate 'B' commits the whole set. It defeats cross-verifier correlation for SEDI
 (Utah's State-Endorsed Digital Identity, Utah Code 63A-20). It is a sibling to
 tests/acdc/test_cp_disclosure.py (contractually-protected disclosure) and
