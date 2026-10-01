@@ -895,6 +895,9 @@ class HttpEnd:
                              rvy=self.parser.rvy,
                              vry=self.parser.vry,
                              version=self.version)
+        # local=True, as WitnessStart.msgDo passes: a witness is designated in
+        # the KELs it receives here, and Kevery misfit-escrows a non-local
+        # event for a locally witnessed KEL, which would stop receipting.
         psr.parse(ims=bytearray(msg), local=True)
 
     def on_post(self, req, rep):
