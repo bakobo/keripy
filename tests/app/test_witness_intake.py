@@ -116,3 +116,14 @@ def test_put_after_short_attachment_group_lands():
                        _Rep())
         _drain(parser)
         assert clientB.pre in witHby.kevers
+
+
+def test_post_after_version_change_lands():
+    """A version code in one request does not change the version the next is parsed with."""
+    with _witness() as (witHby, clientA, clientB, parser, httpEnd):
+        body, att = _split(clientA)
+        v1 = "-_AAA" + counting.Counter.verToB64(major=1, minor=0)
+        httpEnd.on_post(_Req(body, att + v1), _Rep())
+        httpEnd.on_post(_Req(*_split(clientB)), _Rep())
+        _drain(parser)
+        assert clientB.pre in witHby.kevers
