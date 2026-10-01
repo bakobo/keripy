@@ -77,7 +77,9 @@ setup(
                         'cbor2==6.1.4',
                         'multidict==6.8.0',
                         'ordered-set==4.1.0',
-                        'hio==0.7.20',
+                        # bakobo/hio's bakobo/stack: 0.7.20 plus ioflo/hio#162 and HTTP
+                        # body-size limits in the server and client.
+                        'hio @ git+https://github.com/bakobo/hio@f818517b4bac749fda17bff3ed504962df6c99c2',
                         'multicommand==1.0.0',
                         'jsonschema==4.26.0',
                         'falcon==4.3.1',
