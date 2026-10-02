@@ -4,7 +4,9 @@ keri.peer.httping module
 
 """
 import datetime
+import ipaddress
 import json
+import socket
 from dataclasses import dataclass
 from urllib import parse
 
@@ -14,7 +16,7 @@ from hio.core import http
 from hio.help import Hict, ogler
 
 from ..kering import (ShortageError, ExtractionError,
-                      ColdStartError, sniff, Colds)
+                      ColdStartError, ValidationError, sniff, Colds)
 from ..core import SerderKERI
 from ..end import designature
 from ..help import nowUTC
@@ -25,6 +27,221 @@ logger = ogler.getLogger()
 CESR_CONTENT_TYPE = "application/cesr"
 CESR_ATTACHMENT_HEADER = "CESR-ATTACHMENT"
 CESR_DESTINATION_HEADER = "CESR-DESTINATION"
+
+#: Maximum size in bytes of an inbound HTTP request body keripy will read from a
+#: front-door route. A KERI event plus its CESR attachment set is a few KB even
+#: for a large multisig or credential-chain POST; 5 MiB leaves room for hundreds
+#: of events while refusing the unbounded body that exhausts memory. NOTE:
+#: this is a PARTIAL mitigation. hio buffers the whole request body before falcon
+#: dispatches, so this handler-level check runs after the bytes are resident; it
+#: removes the json.load amplification and rejects an over-declared Content-Length
+#: without parsing, but full closure of the oversize-body case requires a
+#: body limit in the hio HTTP server layer.
+MAX_CESR_BODY_SIZE = 5 * 1024 * 1024
+
+#: URL schemes keripy will fetch. Anything else (file://, gopher://, ...) is an
+#: fetch target, never a legitimate KERI endpoint.
+ALLOWED_URL_SCHEMES = ("http", "https")
+
+#: When True, checkUrl additionally refuses RFC-1918 / ULA private ranges
+#: (10/8, 172.16/12, 192.168/16, fc00::/7). Default False: private-network
+#: witnesses / OOBIs are a normal KERI deployment and a private-IP fetch carries
+#: no KERI trust risk (the KEL/TEL is cryptographically verified regardless of
+#: fetch origin), so blocking them is availability loss for no doctrinal gain.
+#: This opt-in is DECOUPLED from the link-local / cloud-metadata block below,
+#: which is unconditional: flipping this flag never re-arms metadata access.
+BLOCK_PRIVATE_ADDRESSES = False
+
+
+def _addressBlocked(ip, blockPrivate):
+    """Return True if ip (an ipaddress object) is a destination keripy must not
+    fetch.
+
+    The truly-unroutable / infrastructure classes are blocked UNCONDITIONALLY
+    with no opt-out: link-local (169.254.0.0/16 and fe80::/10, which is how the
+    169.254.169.254 cloud-metadata access is reached), multicast, reserved and the
+    unspecified address. Loopback is always allowed (local dev / tests). RFC-1918
+    / ULA private ranges are allowed by default and only blocked when the
+    blockPrivate opt-in is set — decoupled from the classes above so an operator
+    can permit private OOBIs without ever re-arming metadata access.
+    """
+    if ip.is_loopback:  # local dev / tests use 127.0.0.1 / ::1
+        return False
+    # IPv4-mapped IPv6 (::ffff:169.254.169.254) already reports is_link_local via
+    # ipaddress, so the metadata block below covers the mapped form too.
+    if ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified:
+        return True
+    if ip.is_private:  # RFC-1918 / ULA: opt-in only
+        return blockPrivate
+    return False
+
+
+def checkUrl(url, *, blockPrivate=None):
+    """Validate a URL before keripy fetches it, guarding against fetches steered by a
+    malicious designated witness or an introduced OOBI.
+
+    Enforces a scheme allow-list and refuses hosts that resolve to a link-local
+    (169.254.169.254 cloud metadata), multicast, reserved or unspecified address
+    unconditionally. RFC-1918 / ULA private ranges are allowed by default and
+    refused only when blockPrivate (or the module BLOCK_PRIVATE_ADDRESSES flag)
+    is set. Loopback is allowed. Literal-IP metadata/private targets are caught
+    directly; a hostname is resolved and each resolved address is checked, so
+    decimal/hex/octal-encoded and IPv4-mapped metadata forms are caught via the
+    resolver. A hostname that cannot be resolved is passed through (the fetch
+    fails on its own).
+
+    Parameters:
+        url (str): the URL about to be fetched.
+        blockPrivate (bool|None): opt-in to also block private ranges; None uses
+            the module default BLOCK_PRIVATE_ADDRESSES.
+
+    Returns:
+        the urlparse result on success.
+
+    Raises:
+        kering.ValidationError: if the scheme is not allowed or the host is a
+            blocked destination.
+    """
+    if blockPrivate is None:
+        blockPrivate = BLOCK_PRIVATE_ADDRESSES
+
+    purl = parse.urlparse(url)
+    if purl.scheme not in ALLOWED_URL_SCHEMES:
+        raise ValidationError(f"Invalid URL scheme {purl.scheme!r}; only "
+                              f"{ALLOWED_URL_SCHEMES} are fetched. url={url!r}")
+    if not purl.hostname:
+        raise ValidationError(f"URL {url!r} has no host.")
+
+    checkHost(purl.hostname, purl.port, blockPrivate=blockPrivate, url=url)
+    return purl
+
+
+def checkHost(host, port=None, *, blockPrivate=None, url=None):
+    """The address half of the address policy, with no opinion about scheme.
+
+    Kept separate from :func:`checkUrl` because the policy is about where a
+    connection lands, not about which protocol carries it. checkUrl owns the
+    http/https allow-list and calls this; a transport that is not HTTP — the TCP
+    witness messengers in app.agenting — calls this directly, after its own
+    scheme check. Before the split there was no way to reuse the address policy
+    without also asserting the URL was fetchable over HTTP, so the TCP paths
+    enforced nothing and the witness chose which of the two keripy used.
+
+    Parameters:
+        host (str): hostname or literal IP the connection will be made to.
+        port (int|None): port, used only to steer address resolution.
+        blockPrivate (bool|None): opt-in to also block private ranges; None uses
+            the module default BLOCK_PRIVATE_ADDRESSES.
+        url (str|None): the full URL, quoted in the error when there is one.
+
+    Raises:
+        kering.ValidationError: if the host is a blocked destination.
+    """
+    if blockPrivate is None:
+        blockPrivate = BLOCK_PRIVATE_ADDRESSES
+
+    where = f" url={url!r}" if url is not None else ""
+
+    try:  # literal IP address?
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        ip = None
+
+    if ip is not None:
+        if _addressBlocked(ip, blockPrivate):
+            raise ValidationError(f"Host {host} is a blocked non-public "
+                                  f"address; refusing to connect (address policy).{where}")
+        return
+
+    # a hostname (which may be a decimal/hex/octal-encoded IP): block if it
+    # resolves to a blocked address; if it cannot be resolved, let the connection
+    # itself fail rather than false-positive here.
+    try:
+        infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)
+    except OSError:
+        infos = []
+    for info in infos:
+        try:
+            rip = ipaddress.ip_address(info[4][0])
+        except ValueError:
+            continue
+        if _addressBlocked(rip, blockPrivate):
+            raise ValidationError(f"Host {host} resolves to blocked "
+                                  f"non-public address {rip}; refusing to connect "
+                                  f"(address policy).{where}")
+
+
+#: Default maximum number of HTTP redirects keripy will follow. redirectable=False
+#: (a zero budget) breaks endpoints behind an http->https ingress (k8s 301/308);
+#: a small budget with per-hop revalidation keeps those working without letting a
+#: peer redirect keripy into a blocked range.
+MAX_REDIRECTS = 3
+
+
+class RedirectGuardedClient(http.clienting.Client):
+    """hio HTTP Client that follows a bounded number of redirects and re-runs the
+    address policy (checkUrl) on each redirect target before following it.
+
+    hio's Client redirects unconditionally when redirectable is True; setting it
+    False (a zero budget) breaks endpoints behind an http->https ingress. This
+    subclass allows redirects but caps them at maxRedirects and refuses any hop
+    whose resolved target fails checkUrl, so a peer cannot use a 3xx to redirect
+    keripy into 169.254.169.254 or another blocked range. A refused/over-budget redirect surfaces the 3xx as the terminal
+    response instead of being followed, so nothing crashes and the caller simply
+    sees a non-2xx result.
+    """
+
+    def __init__(self, *args, maxRedirects=MAX_REDIRECTS, blockPrivate=None, **kwa):
+        self.maxRedirects = maxRedirects
+        self._blockPrivate = blockPrivate
+        kwa.setdefault("redirectable", True)
+        super(RedirectGuardedClient, self).__init__(*args, **kwa)
+
+    def _redirectPermitted(self):
+        """Return True if the pending redirect (self.redirects[-1]) may be
+        followed: within the redirect budget AND its resolved target passes the
+        address policy. A relative/self redirect stays on the already-validated host,
+        so it re-validates trivially."""
+        if not self.redirects:
+            return True
+        if len(self.redirects) > self.maxRedirects:
+            logger.error(f"refusing redirect: exceeds budget of {self.maxRedirects}")
+            return False
+
+        latest = self.redirects[-1]
+        headers = latest.get("headers") or {}
+        location = headers.get("location")
+        if not location:
+            return True
+
+        req = latest.get("request") or {}
+        scheme = req.get("scheme") or getattr(self.requester, "scheme", "http")
+        host = req.get("host") or getattr(self.requester, "hostname", "")
+        port = req.get("port") or getattr(self.requester, "port", None)
+        base = f"{scheme}://{host}:{port}{req.get('path') or '/'}"
+        target = parse.urljoin(base, location)
+        try:
+            checkUrl(target, blockPrivate=self._blockPrivate)
+        except ValidationError as e:
+            logger.error(f"refusing redirect to {location!r}: {e}")
+            return False
+        return True
+
+    def redirect(self):
+        """Revalidate and budget-check before delegating to hio's redirect."""
+        if self.redirects and not self._redirectPermitted():
+            # Surface the 3xx as the terminal response rather than following it.
+            resp = self.redirects.pop()
+            if self.redirects:
+                resp["redirects"] = list(self.redirects)
+            self.redirects = []
+            self.responses.append(resp)
+            self.waited = False
+            if self.respondent is not None:
+                self.respondent.redirectant = False
+                self.respondent.redirected = False
+            return
+        return super(RedirectGuardedClient, self).redirect()
 
 
 class SignatureValidationComponent(object):
@@ -43,7 +260,9 @@ class SignatureValidationComponent(object):
 
         """
         sig = req.headers.get("SIGNATURE")
-        ked = req.media
+        # Bound the body before parsing it.
+        raw = readBoundedBody(req)
+        ked = json.loads(raw)
         ser = json.dumps(ked).encode("utf-8")
         if not self.validate(sig=sig, ser=ser):
             resp.complete = True
@@ -71,6 +290,89 @@ class SignatureValidationComponent(object):
         return True
 
 
+def enforceMaxBody(req, limit=MAX_CESR_BODY_SIZE):
+    """Reject a declared Content-Length over ``limit`` with 413 before the body is
+    read at all. PARTIAL: hio has already buffered the body by the time a falcon
+    handler runs, so this cannot fully close the oversize-body case (that
+    needs an hio server-layer limit); it removes parse amplification and refuses
+    an honestly-declared over-cap request without copying it.
+
+    Parameters:
+        req (falcon.Request): inbound request.
+        limit (int): maximum allowed body size in bytes.
+    """
+    clen = req.content_length
+    if clen is not None and clen > limit:
+        raise falcon.HTTPError(falcon.HTTP_413,
+                               title="Request body too large",
+                               description=f"Request body of {clen} bytes exceeds "
+                                           f"the maximum allowed size of {limit} bytes.")
+
+
+def readBoundedBody(req, limit=MAX_CESR_BODY_SIZE):
+    """Reject an over-cap declared Content-Length, then read at most ``limit`` bytes
+    (+1 to detect overflow) so an undeclared / chunked body is bounded on read
+    too. Returns the raw body bytes. Raises falcon HTTP 413 if over the cap.
+
+    Parameters:
+        req (falcon.Request): inbound request.
+        limit (int): maximum allowed body size in bytes.
+    """
+    enforceMaxBody(req, limit)
+    raw = req.bounded_stream.read(limit + 1)
+    if len(raw) > limit:
+        raise falcon.HTTPError(falcon.HTTP_413,
+                               title="Request body too large",
+                               description=f"Request body exceeds the maximum "
+                                           f"allowed size of {limit} bytes.")
+    return raw
+
+
+#: Maximum size in bytes of an HTTP response body keripy will copy/parse from a
+#: (possibly malicious designated) peer. Like the request cap this is a PARTIAL
+#: mitigation: hio's client buffers the whole response before this runs, so it
+#: does NOT close the client-side OOM — that needs an hio streaming
+#: response cap. It removes the copy/parse amplification and never raises into a
+#: caller's doer.
+MAX_RESPONSE_SIZE = 32 * 1024 * 1024
+
+
+def boundedResponseBody(rep):
+    """Return the response body as bytes if within MAX_RESPONSE_SIZE, else None.
+
+    NEVER raises into the caller (the prior implementation raised ValidationError
+    into the Receiptor.receipt/get generators with no handler, crashing the
+    Doist). hio has already buffered the response,
+    so this only bounds what keripy copies and hands to the parser; over-cap it
+    logs and returns None so the caller drops the response instead of parsing an
+    unbounded body. The response itself is bounded by hio's streaming cap.
+
+    Parameters:
+        rep: hio HTTP response object exposing ``.body`` and optionally
+            ``.headers``.
+
+    Returns:
+        bytes | None: the body, or None if it exceeds the cap.
+    """
+    headers = getattr(rep, "headers", None) or {}
+    clen = headers.get("Content-Length") if hasattr(headers, "get") else None
+    if clen is not None:
+        try:
+            if int(clen) > MAX_RESPONSE_SIZE:
+                logger.error(f"dropping over-cap response: Content-Length {clen} "
+                             f"exceeds {MAX_RESPONSE_SIZE} bytes")
+                return None
+        except (TypeError, ValueError):
+            pass  # unparseable header, fall through to the body-length check
+
+    body = getattr(rep, "body", None) or b""
+    if len(body) > MAX_RESPONSE_SIZE:
+        logger.error(f"dropping over-cap response body of {len(body)} bytes "
+                     f"(exceeds {MAX_RESPONSE_SIZE})")
+        return None
+    return bytes(body)
+
+
 @dataclass
 class CesrRequest:
     payload: dict
@@ -91,8 +393,11 @@ def parseCesrHttpRequest(req):
                                title="Content type error",
                                description="Unacceptable content type.")
 
+    # Bound the body before parsing: rejects an over-cap declared Content-Length
+    # with 413 and removes the json.load amplification.
+    raw = readBoundedBody(req)
     try:
-        data = json.load(req.bounded_stream)
+        data = json.loads(raw)
     except ValueError:
         raise falcon.HTTPError(falcon.HTTP_400,
                                title="Malformed JSON",
@@ -250,10 +555,14 @@ class Clienter(doing.DoDoer):
         Returns:
             http.clienting.Client: The hio HTTP Client used for the request, or None if an error occurs.
         """
-        purl = parse.urlparse(url)
+        try:  # address policy: scheme allow-list + block non-public hosts
+            purl = checkUrl(url)
+        except ValidationError as e:
+            logger.error(f"refusing to fetch blocked url={url!r}: {e}")
+            return None
 
         try:
-            client = http.clienting.Client(scheme=purl.scheme,
+            client = RedirectGuardedClient(scheme=purl.scheme,
                                            hostname=purl.hostname,
                                            port=purl.port,
                                            portOptional=True)

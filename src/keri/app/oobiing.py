@@ -13,7 +13,7 @@ import falcon
 from hio.base import doing
 from hio.help import decking, ogler
 
-from .httping import Clienter,CESR_CONTENT_TYPE
+from .httping import Clienter, readBoundedBody, CESR_CONTENT_TYPE
 from .organizing import Organizer
 from .. import (Vrsn_2_0, Version, Roles, Schemes, Ilks, Kinds,
                 ValidationError, UnverifiedReplyError,
@@ -171,7 +171,15 @@ class OobiResource:
             responses:
                202:
                   description: OOBI resolution to key state successful"""
-        body = req.get_media()
+        # Bound the body before parsing: get_media buffers
+        # the whole body, so read a capped amount and decode it ourselves.
+        raw = readBoundedBody(req)
+        try:
+            body = json.loads(raw)
+        except ValueError:
+            rep.status = falcon.HTTP_400
+            rep.text = "invalid OOBI request body, could not decode JSON"
+            return
 
         if "url" in body:
             oobi = body["url"]
@@ -664,6 +672,10 @@ class Authenticator:
 
     def request(self, wurl, obr):
         client = self.clienter.request("GET", wurl)
+        if client is None:  # blocked (address policy) or unbuildable; mirror Oobiery.request
+            self.hby.db.woobi.rem(keys=(wurl,))
+            print(f"error getting client for {wurl}, aborting wOOBI")
+            return
 
         self.clients[wurl] = client
         self.hby.db.woobi.rem(keys=(wurl,))

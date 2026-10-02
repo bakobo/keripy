@@ -58,6 +58,7 @@ from hio.base import filing
 
 from keri import __version__
 from ..kering import MaxON  # maximum ordinal number for seqence or first seen
+from ..kering import DatabaseError
 from ..help import helping
 
 ProemSize = 32  # does not include trailing separator
@@ -524,7 +525,7 @@ class LMDBer(filing.Filer):
         if hasattr(val, "encode"):
             val = val.encode("utf-8")  # convert str to bytes
 
-        with self.env.begin(write=True) as txn:
+        with self._writeTxn(write=True) as txn:
             cursor = txn.cursor()
             cursor.replace(b'__version__', val)
 
@@ -645,6 +646,33 @@ class LMDBer(filing.Filer):
             return  # done raises StopIteration
 
     # For subdbs with no duplicate values allowed at each key. (dupsort==False)
+    @contextmanager
+    def _writeTxn(self, **kwa):
+        """Context manager wrapping self.env.begin(write=True, ...) that
+        translates lmdb.MapFullError into kering.DatabaseError.
+
+        LMDB raises MapFullError when a write cannot fit in the memory map. For
+        realistic small values this surfaces at COMMIT -- the transaction's
+        __exit__, i.e. the ``with self.env.begin(...)`` line itself -- which is
+        OUTSIDE any try/except wrapped around an individual ``.put()``. Wrapping
+        the whole ``with`` block here catches both the put-time and the
+        commit-time raise and re-raises a keri.kering error, so a raw
+        lmdb.MapFullError no longer escapes the keri hierarchy and kills the
+        Doist.
+
+        Note: a full map is a fatal write condition, not a recoverable one.
+        Translation improves diagnosability and lets reads continue; it does not
+        make the write succeed. Availability under a fill flood depends on
+        bounding what fills the map (the inbound body/escrow caps), not on this
+        translation.
+        """
+        try:
+            with self.env.begin(**kwa) as txn:
+                yield txn
+        except lmdb.MapFullError as ex:
+            raise DatabaseError(f"LMDB map full (size={self.MapSize} bytes); "
+                                f"write rejected. ref) lmdb.MapFullError") from ex
+
     def putVal(self, db, key, val):
         """
         Write serialized bytes val to location key in db
@@ -659,7 +687,7 @@ class LMDBer(filing.Filer):
         if not key:
             return False
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             try:
                 return (txn.put(key, val, overwrite=False))
             except lmdb.BadValsizeError as ex:
@@ -682,7 +710,7 @@ class LMDBer(filing.Filer):
             val: bytes of value to be written"""
         if not key:
             return False
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             try:
                 return (txn.put(key, val))
             except lmdb.BadValsizeError as ex:
@@ -755,7 +783,7 @@ class LMDBer(filing.Filer):
         if val is None or not key:
             return False
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             onkey = onKey(key, on, sep=sep)
             try:
                 return (txn.put(onkey, val, overwrite=False))
@@ -784,7 +812,7 @@ class LMDBer(filing.Filer):
         if val is None or not key:
             return False
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             onkey = onKey(key, on, sep=sep)  # start replay at this enty 0 is earliest
             try:
                 return (txn.put(onkey, val))
@@ -817,7 +845,7 @@ class LMDBer(filing.Filer):
         if not key or val is None:
             raise ValueError(f"Bad append parameter: {key=} or {val=}")
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             onkey = onKey(key, MaxON, sep=sep)
             on = 0  # unless other cases match then zeroth entry at key
             cursor = txn.cursor()
@@ -1113,7 +1141,7 @@ class LMDBer(filing.Filer):
             key (bytes|None): Apparent effective key
             vals (NonStrIterable|None): serialized values to add to set of vals at key
             sep (bytes): separator character for split"""
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             result = False
             if not key or not vals:  # empty key or empty vals or vals None
                 return result
@@ -1164,7 +1192,7 @@ class LMDBer(filing.Filer):
             return result  # do not delete
 
         self.remIoSet(db=db, key=key, sep=sep)
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             vals = oset(vals)  # make set
 
             for i, val in enumerate(vals):
@@ -1191,7 +1219,7 @@ class LMDBer(filing.Filer):
             key (bytes|None): Apparent effective key
             val (bytes|None): serialized value to add
             sep (bytes): separator character for split"""
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             if not key or val is None:  # empty key or val is missing
                 return False
             vals = oset()
@@ -1607,7 +1635,7 @@ class LMDBer(filing.Filer):
         if not key or not vals or not helping.isNonStringIterable(vals):
             raise ValueError(f"Bad append parameter: {key=} or {vals=}")
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             onkey = onKey(key, on=MaxON, sep=sep)  # start at max and walk back
             iokey = suffix(onkey, ion=MaxON, sep=sep)
             on = 0  # unless other cases match then zeroth entry at key
@@ -2215,7 +2243,7 @@ class LMDBer(filing.Filer):
         if not key:
             return False
 
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             result = True
             try:
                 for val in vals:
@@ -2250,7 +2278,7 @@ class LMDBer(filing.Filer):
         dups = set(self.getVals(db, key))  #get preexisting dups if any
         result = False
         if val not in dups:
-            with self.env.begin(db=db, write=True, buffers=True) as txn:
+            with self._writeTxn(db=db, write=True, buffers=True) as txn:
                 try:
                     result = txn.put(key, val, dupdata=True)
                 except lmdb.BadValsizeError as ex:
@@ -2409,7 +2437,7 @@ class LMDBer(filing.Filer):
         if not key or not vals or key[:1] == b'.':
             return result
         dups = set(self.getIoDupVals(db, key))  # get preexisting dups if any
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             idx = 0
             cursor = txn.cursor()
             try:
@@ -2783,7 +2811,7 @@ class LMDBer(filing.Filer):
 
         result = False
         dups = set(self.getOnIoDupVals(db, key))  #get preexisting dups if any
-        with self.env.begin(db=db, write=True, buffers=True) as txn:
+        with self._writeTxn(db=db, write=True, buffers=True) as txn:
             idx = 0
             cursor = txn.cursor()
             onkey = onKey(key, on, sep=sep)

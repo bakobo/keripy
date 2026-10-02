@@ -13,9 +13,10 @@ from hio.help import decking, Hict, ogler
 
 from socket import gaierror
 
-from .httping import Clienter, streamCESRRequests, CESR_DESTINATION_HEADER
+from .httping import (Clienter, streamCESRRequests, checkUrl, checkHost, boundedResponseBody,
+                      RedirectGuardedClient, CESR_DESTINATION_HEADER)
 
-from ..kering import (Schemes, Roles,
+from ..kering import (Schemes, Roles, ValidationError,
                       MissingEntryError, ConfigurationError)
 from ..core import eventing, parsing, coring, serdering
 
@@ -93,7 +94,7 @@ class Receiptor(doing.DoDoer):
                 clients[wit] = client
                 doers.append(clientDoer)
                 self.extend([clientDoer])
-            except (MissingEntryError, gaierror) as e:
+            except (MissingEntryError, gaierror, ValidationError) as e:
                 logger.error(f"unable to create http client for witness {wit}: {e}")
 
         # send to each witness and gather receipts
@@ -108,8 +109,11 @@ class Receiptor(doing.DoDoer):
                 yield self.tock
 
             rep = client.respond()
-            if rep.status == 200:
-                hab.psr.parseOne(bytearray(rep.body))
+            # Bound what we copy/parse from the witness; boundedResponseBody
+            # never raises into this generator.
+            body = boundedResponseBody(rep) if rep.status == 200 else None
+            if rep.status == 200 and body is not None:
+                hab.psr.parseOne(bytearray(body))
                 rcts[wit] = None
             else:
                 print(f"invalid response {rep.status} from witnesses {wit}")
@@ -182,12 +186,17 @@ class Receiptor(doing.DoDoer):
             yield self.tock
 
         rep = client.respond()
-        if rep.status == 200:
-            rct = bytearray(rep.body)
-            hab.psr.parseOne(bytearray(rct))
+        ok = rep.status == 200
+        if ok:
+            # Bound what we copy/parse; boundedResponseBody never raises here.
+            body = boundedResponseBody(rep)
+            if body is not None:
+                hab.psr.parseOne(bytearray(body))
+            else:
+                ok = False
 
         self.clienter.remove(client)
-        return rep.status == 200
+        return ok
 
     def catchup(self, pre, wit):
         """
@@ -205,7 +214,11 @@ class Receiptor(doing.DoDoer):
 
         hab = self.hby.habs[pre]
 
-        client, clientDoer = httpClient(hab, wit)
+        try:
+            client, clientDoer = httpClient(hab, wit)
+        except (MissingEntryError, gaierror, ValidationError) as e:
+            logger.error(f"unable to catch up witness {wit}: {e}")
+            return
         self.extend([clientDoer])
 
         for fmsg in hab.db.clonePreIter(pre=pre, version=hab.kever.serder.pvrsn):
@@ -692,6 +705,13 @@ class TCPMessenger(doing.DoDoer):
             url (str): tcp endpoint URL for the witness.
             msgs (Deck | None): outbound message queue.
             sent (Deck | None): sent message queue."""
+        # address policy, same policy the HTTP messengers apply (raises
+        # kering.ValidationError). Checked here rather than in receiptDo so a
+        # blocked witness fails where the caller can see it, and before the
+        # Doist owns the failure.
+        up = urlparse(url)
+        checkHost(up.hostname, up.port, url=url)
+
         self.hab = hab
         self.wit = wit
         self.url = url
@@ -763,6 +783,10 @@ class TCPStreamMessenger(doing.DoDoer):
             url (str): tcp endpoint URL for the witness.
             msgs (Deck | None): outbound message queue.
             sent (Deck | None): sent message queue."""
+        # address policy, as in TCPMessenger (raises kering.ValidationError).
+        up = urlparse(url)
+        checkHost(up.hostname, up.port, url=url)
+
         self.hab = hab
         self.wit = wit
         self.url = url
@@ -851,7 +875,12 @@ class HTTPMessenger(doing.DoDoer):
         if up.scheme != Schemes.http and up.scheme != Schemes.https:
             raise ValueError(f"invalid scheme {up.scheme} for HTTPMessenger")
 
-        self.client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname, port=up.port)
+        # address policy: refuse a witness endpoint that resolves to a blocked
+        # non-public host (raises kering.ValidationError). A bounded, per-hop
+        # revalidated redirect budget keeps http->https ingress working.
+        checkUrl(url)
+        self.client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname,
+                                            port=up.port)
         clientDoer = http.clienting.ClientDoer(client=self.client)
 
         doers.extend([clientDoer])
@@ -918,7 +947,10 @@ class HTTPStreamMessenger(doing.DoDoer):
         if up.scheme != Schemes.http and up.scheme != Schemes.https:
             raise ValueError(f"invalid scheme {up.scheme} for HTTPMessenger")
 
-        self.client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname, port=up.port)
+        # address policy on the message-send path (raises kering.ValidationError).
+        checkUrl(url)
+        self.client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname,
+                                            port=up.port)
         clientDoer = http.clienting.ClientDoer(client=self.client)
 
         headers = Hict([
@@ -1049,8 +1081,10 @@ def httpClient(hab, wit):
         raise MissingEntryError(f"unable to query witness {wit}, no http endpoint")
 
     url = urls[Schemes.https] if Schemes.https in urls else urls[Schemes.http]
-    up = urlparse(url)
-    client = http.clienting.Client(scheme=up.scheme, hostname=up.hostname, port=up.port, path=up.path)
+    # address policy on the witness fetch/send path (raises kering.ValidationError).
+    up = checkUrl(url)
+    client = RedirectGuardedClient(scheme=up.scheme, hostname=up.hostname, port=up.port,
+                                   path=up.path)
     clientDoer = http.clienting.ClientDoer(client=client)
 
     return client, clientDoer

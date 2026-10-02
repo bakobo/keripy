@@ -83,11 +83,11 @@ setup(
                         # instance, so every Baser/Keeper/Configer/Reger/Mailboxer opened with
                         # temp=True strands an empty keri_*_test skeleton in /tmp for the life of
                         # the box. hio 0.7.20 on PyPI does NOT carry the fix (its filing.py is
-                        # 7b0350ea's minus #162), so the stack pins the bakobo fork at the #162
-                        # merge commit, which is otherwise identical to 0.7.20.
+                        # 7b0350ea's minus #162), so the stack pins the bakobo fork's
+                        # bakobo/stack branch, which is #162 plus HTTP body-size limits.
                         # tests/db/test_temp_root.py fails the day this regresses. Revert to a
-                        # version constraint once a PyPI release carries #162.
-                        'hio @ git+https://github.com/bakobo/hio@7b0350eab3115f42cd6be5dee2b203d052a320aa',
+                        # version constraint once a PyPI release carries both.
+                        'hio @ git+https://github.com/bakobo/hio@f818517b4bac749fda17bff3ed504962df6c99c2',
                         'multicommand==1.0.0',
                         'jsonschema==4.26.0',
                         'falcon==4.3.1',
