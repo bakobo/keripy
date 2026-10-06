@@ -4661,7 +4661,11 @@ class Tholder:
         Parameters:
             indices: list of indices (offsets into key list) of verified signatures"""
         try:
-            if self.thold > 0 and len(indices) >= self.thold:  # at least one
+            # Count distinct indices, not raw signatures. Each index identifies one key in the
+            # ordered key list, so two verified signatures at the same index (e.g. one key's
+            # signature re-encoded under different indexed codes) are one signer and must count
+            # once. This mirrors _satisfy_weighted, which already deduplicates indices.
+            if self.thold > 0 and len(set(indices)) >= self.thold:  # at least one
                 return True
 
         except Exception as ex:

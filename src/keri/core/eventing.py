@@ -330,10 +330,13 @@ def verifySigs(raw, sigers, verfers):
         verfers: list of Verfer instance (public keys)"""
     if sigers is None:
         sigers = []
-    # Ensure no duplicate sigers by using set math on sigers' sigs otherwise
-    # indices count for threshold will be erroneous. Does not modify in place
-    # passed in sigers list, but instead depends on caller to use indices to
-    # modify its copy to filter out unverifiable or duplicate sigers
+    # Drop byte-for-byte duplicate signatures using set math on their qb64. NOTE: qb64 is NOT a
+    # signer-canonical identity — one (raw signature, index) pair has several valid indexed
+    # encodings (e.g. codes A, B, 2A, 2B), so this does NOT make a threshold count safe on its
+    # own. Every threshold gate MUST count DISTINCT indices (len(set(indices)) / distinct witness
+    # indices), never len() of this returned list, or one key's re-encoded signature inflates the
+    # count. Does not modify in place passed in sigers list, but instead depends on caller to use
+    # indices to modify its copy to filter out unverifiable or duplicate sigers.
     usigs = oset([siger.qb64 for siger in sigers])
     usigers = [Siger(qb64=sig) for sig in usigs]
 
@@ -2885,7 +2888,9 @@ class Kever:
                     if toader.num != 0:  # invalid toad
                         raise ValidationError(f"Invalid toad = {toader.num} for wits = {wits}")
 
-                if len(windices) < toader.num:  # not fully witnessed yet
+                # Count distinct witness indices, not raw receipts: one witness's receipt
+                # re-encoded under more than one indexed code must not inflate the toad.
+                if len(set(windices)) < toader.num:  # not fully witnessed yet
                     if self.escrowPWEvent(serder=serder, wigers=wigers, sigers=sigers,
                                           delsner=delsner, delsger=delsger,
                                           local=local):
@@ -5593,7 +5598,8 @@ class Kevery:
             wigers = self.db.wigs.get(keys=(pre, kever.serder.saidb))
 
 
-            if len(wigers) < kever.toader.num:
+            # Count distinct witness indices so re-encoded receipts cannot fake full witnessing.
+            if len({wiger.index for wiger in wigers}) < kever.toader.num:
                 self.escrowQueryNotFoundEvent(serder=serder, prefixer=source, sigers=sigers, cigars=cigars)
                 msg = f"Query not found error on event route={route} SAID={serder.said}"
                 logger.debug(msg)

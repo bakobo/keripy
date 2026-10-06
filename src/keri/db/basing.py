@@ -2040,7 +2040,9 @@ class Baser(LMDBer):
         kever = self.kevers[serder.pre]
         toad = kever.toader.num
 
-        return not len(wigers) < toad
+        # Count distinct witness indices, not raw receipts: one witness's receipt re-encoded
+        # under more than one indexed code must not fake full witnessing.
+        return not len({wiger.index for wiger in wigers}) < toad
 
     def resolveVerifiers(self, pre=None, sn=0, dig=None):
         """

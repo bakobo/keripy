@@ -1263,8 +1263,6 @@ class Tever:
 
         Returns:
             list: unique validated signature verified members of inputed bigers"""
-        for bak in baks:
-            print("BAK :", bak)
         berfers = [Verfer(qb64=bak) for bak in baks]
 
         # get unique verified bigers and bindices lists from bigers list
@@ -1287,7 +1285,9 @@ class Tever:
                 raise ValidationError("Invalid toad = {} for wits = {} for evt"
                                       " = {}.".format(toad, baks, serder.ked))
 
-            if len(bindices) < toad:  # not fully witnessed yet
+            # Count distinct backer indices, not raw receipts: one backer's receipt re-encoded
+            # under more than one indexed code must not inflate the backer threshold.
+            if len(set(bindices)) < toad:  # not fully witnessed yet
                 self.escrowPWEvent(serder=serder, seqner=seqner, saider=saider, bigers=bigers)
                 msg = (f"Failure satisfying toad = {toad} on witness sigs "
                        f"for {[siger.qb64 for siger in bigers]} for evt = {serder.said}")

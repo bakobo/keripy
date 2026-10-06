@@ -3388,3 +3388,152 @@ def test_keyeventsequence_1():
         assert db_digs == event_digs
 
     """ Done Test """
+
+
+def test_numeric_threshold_counts_distinct_indices_not_signatures():
+    """A numeric signing threshold must count distinct key-list indices, not raw signatures.
+
+    Regression for the signing-threshold bypass (GHSA qmgq-mfw3-m3jr): one controller key could
+    satisfy a k-of-n threshold by attaching its single signature under two different indexed
+    codes at the same index. Tholder._satisfy_numeric counted len(indices); it now counts
+    len(set(indices)), matching the weighted path. This is the shared chokepoint for the current
+    signing threshold, the prior-next rotation threshold, and witness/backer thresholds, so the
+    end-to-end cases below (inception current-threshold and rotation prior-next threshold) both
+    rest on it.
+    """
+    from keri.core import Tholder
+    from keri.core.indexing import IdrDex
+
+    # The fix, at its source: duplicate indices collapse; distinct indices count.
+    assert Tholder(sith="2").satisfy([0, 0]) is False
+    assert Tholder(sith="2").satisfy([0, 1]) is True
+    assert Tholder(sith="1").satisfy([0, 0]) is True  # one signer still satisfies 1-of-n
+    # The weighted path already deduplicated and is unchanged.
+    assert Tholder(sith=["1/2", "1/2"]).satisfy([0, 0]) is False
+    assert Tholder(sith=["1/2", "1/2"]).satisfy([0, 1]) is True
+
+    def run(msgs, name, pre):
+        with openDB(name=name) as db:
+            kvy = Kevery(db=db, lax=False, local=False)
+            for m in msgs:
+                try:
+                    Parser(kvy=kvy).parse(ims=bytearray(m))
+                except Exception:
+                    pass
+            kev = kvy.kevers.get(pre)
+            return (kev is not None, kev.sner.num if kev is not None else None)
+
+    s0 = Signer(raw=b"\x01" * 32, transferable=True)
+    s1 = Signer(raw=b"\x02" * 32, transferable=True)
+    # --- current signing threshold, on an inception ---
+    nd = [Diger(ser=x.verfer.qb64b).qb64
+          for x in (Signer(raw=b"\x03" * 32), Signer(raw=b"\x04" * 32))]
+    icp = incept(keys=[s0.verfer.qb64, s1.verfer.qb64], isith="2", ndigs=nd, nsith="2",
+                 code=MtrDex.Blake3_256)
+    a = s0.sign(icp.raw, index=0)
+    b = Siger(raw=a.raw, code=IdrDex.Ed25519_Crt_Sig, index=0, verfer=s0.verfer)       # code B
+    big = Siger(raw=a.raw, code=IdrDex.Ed25519_Big_Sig, index=0, ondex=0,
+                verfer=s0.verfer)                                                       # code 2A
+    assert run([bytes(messagize(icp, sigers=[a, b]))], "icp_ab", icp.pre) == (False, None)
+    assert run([bytes(messagize(icp, sigers=[a, big]))], "icp_a2a", icp.pre) == (False, None)
+    a1 = s1.sign(icp.raw, index=1)
+    assert run([bytes(messagize(icp, sigers=[a, a1]))], "icp_ok", icp.pre) == (True, 0)
+
+    # --- prior-next (pre-rotation) threshold, on a rotation ---
+    m0 = Signer(raw=b"\x05" * 32, transferable=True)
+    m1 = Signer(raw=b"\x06" * 32, transferable=True)
+    nd2 = [Diger(ser=m.verfer.qb64b).qb64 for m in (m0, m1)]
+    icp2 = incept(keys=[s0.verfer.qb64, s1.verfer.qb64], isith="2", ndigs=nd2, nsith="2",
+                  code=MtrDex.Blake3_256)
+    icp2msg = bytes(messagize(icp2, sigers=[s0.sign(icp2.raw, index=0), s1.sign(icp2.raw, index=1)]))
+    pn = [Diger(ser=x.verfer.qb64b).qb64
+          for x in (Signer(raw=b"\x07" * 32), Signer(raw=b"\x08" * 32))]
+    # Attacker holds only prior-next key m0. Current key list repeats m0; sign at indices 0 and 1
+    # both exposing ondex 0, so ondices would be [0, 0] -> one prior-next key, must fail nsith 2.
+    rotbad = rotate(pre=icp2.pre, keys=[m0.verfer.qb64, m0.verfer.qb64], dig=icp2.said, sn=1,
+                    isith="2", ndigs=pn, nsith="2")
+    ra = Siger(raw=m0.sign(rotbad.raw, index=0).raw, code=IdrDex.Ed25519_Big_Sig, index=0,
+               ondex=0, verfer=m0.verfer)
+    rb = Siger(raw=m0.sign(rotbad.raw, index=1).raw, code=IdrDex.Ed25519_Big_Sig, index=1,
+               ondex=0, verfer=m0.verfer)
+    assert run([icp2msg, bytes(messagize(rotbad, sigers=[ra, rb]))], "rot_bad", icp2.pre) == (True, 0)
+    # A genuine rotation exposing both prior-next keys still rotates (no regression).
+    rotok = rotate(pre=icp2.pre, keys=[m0.verfer.qb64, m1.verfer.qb64], dig=icp2.said, sn=1,
+                   isith="2", ndigs=pn, nsith="2")
+    ro0 = Siger(raw=m0.sign(rotok.raw, index=0).raw, code=IdrDex.Ed25519_Big_Sig, index=0,
+                ondex=0, verfer=m0.verfer)
+    ro1 = Siger(raw=m1.sign(rotok.raw, index=1).raw, code=IdrDex.Ed25519_Big_Sig, index=1,
+                ondex=1, verfer=m1.verfer)
+    assert run([icp2msg, bytes(messagize(rotok, sigers=[ro0, ro1]))], "rot_ok", icp2.pre) == (True, 1)
+
+
+def test_witness_toad_counts_distinct_indices_not_receipts():
+    """The witness threshold (toad) must count distinct witness indices, not raw receipts.
+
+    Companion to the signing-threshold regression: witness and TEL-backer thresholds are raw
+    len() comparisons (eventing.py:2858, vdr/eventing.py:1290) that do not route through
+    Tholder, so they are deduplicated at the count site. One witness's receipt re-encoded under
+    two indexed codes at the same witness index must not satisfy toad.
+    """
+    from keri.kering import MissingWitnessSignatureError
+    from keri.core.indexing import IdrDex
+
+    ctrl0 = Signer(raw=b"\x11" * 32, transferable=True)
+    ctrl1 = Signer(raw=b"\x12" * 32, transferable=True)
+    wit0 = Signer(raw=b"\x21" * 32, transferable=False)   # witness at index 0
+    wit1 = Signer(raw=b"\x22" * 32, transferable=False)   # witness at index 1
+    nd = [Diger(ser=x.verfer.qb64b).qb64
+          for x in (Signer(raw=b"\x13" * 32), Signer(raw=b"\x14" * 32))]
+    serder = incept(keys=[ctrl0.verfer.qb64, ctrl1.verfer.qb64], isith="2", ndigs=nd, nsith="2",
+                    wits=[wit0.verfer.qb64, wit1.verfer.qb64], toad=2, code=MtrDex.Blake3_256)
+    sigers = [ctrl0.sign(serder.raw, index=0), ctrl1.sign(serder.raw, index=1)]
+
+    # One real witness (wit0 at index 0), its signature re-encoded under A then B.
+    wa = wit0.sign(serder.raw, index=0)                                        # code A
+    wb = Siger(raw=wa.raw, code=IdrDex.Ed25519_Crt_Sig, index=0, verfer=wit0.verfer)  # code B
+
+    def process(wigers, name):
+        with openDB(name=name) as db:
+            kvy = Kevery(db=db, lax=False, local=False)
+            kvy.processEvent(serder, sigers, wigers=wigers)
+
+    # Attack: distinct witness indices = {0} < toad 2, so not fully witnessed.
+    with pytest.raises(MissingWitnessSignatureError):
+        process([wa, wb], "wit_attack")
+
+    # Genuine two distinct witnesses satisfy toad 2 with no witness-shortfall error.
+    w1 = wit1.sign(serder.raw, index=1)
+    process([wa, w1], "wit_ok")
+
+
+def test_fully_witnessed_counts_distinct_witness_indices():
+    """Baser.fullyWitnessed (reached from the TEL anchor, seal, and query paths) must count
+    distinct witness indices, not raw stored receipts. One witness's receipt re-encoded under
+    two indexed codes at the same index must not report an under-witnessed event as fully
+    witnessed. Companion to the witness-TOAD regression (GHSA qmgq-mfw3-m3jr).
+    """
+    from keri.core.indexing import IdrDex
+
+    c0 = Signer(raw=b"\x11" * 32, transferable=True)
+    c1 = Signer(raw=b"\x12" * 32, transferable=True)
+    w0 = Signer(raw=b"\x21" * 32, transferable=False)
+    w1 = Signer(raw=b"\x22" * 32, transferable=False)
+    nd = [Diger(ser=x.verfer.qb64b).qb64
+          for x in (Signer(raw=b"\x13" * 32), Signer(raw=b"\x14" * 32))]
+    serder = incept(keys=[c0.verfer.qb64, c1.verfer.qb64], isith="2", ndigs=nd, nsith="2",
+                    wits=[w0.verfer.qb64, w1.verfer.qb64], toad=2, code=MtrDex.Blake3_256)
+    sigers = [c0.sign(serder.raw, index=0), c1.sign(serder.raw, index=1)]
+    with openDB(name="fw") as db:
+        db.prefixes.add(w0.verfer.qb64)  # seat the kever as locally witnessed
+        kvy = Kevery(db=db, lax=True, local=True)
+        kvy.processEvent(serder, sigers)
+        assert serder.pre in kvy.kevers
+
+        wa = w0.sign(serder.raw, index=0)                                      # code A
+        wb = Siger(raw=wa.raw, code=IdrDex.Ed25519_Crt_Sig, index=0, verfer=w0.verfer)  # code B
+        db.wigs.add(keys=(serder.preb, serder.saidb), val=wa)
+        db.wigs.add(keys=(serder.preb, serder.saidb), val=wb)
+        assert db.fullyWitnessed(serder) is False   # one witness, two encodings
+
+        db.wigs.add(keys=(serder.preb, serder.saidb), val=w1.sign(serder.raw, index=1))
+        assert db.fullyWitnessed(serder) is True    # two distinct witnesses
