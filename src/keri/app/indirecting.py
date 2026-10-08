@@ -922,6 +922,9 @@ class HttpEnd:
                 rep.status = falcon.HTTP_204
             elif ilk in (Ilks.qry,):
                 if serder.sad["r"] in ("mbx",):
+                    if not isinstance(serder.said, str):  # body is unverified here
+                        rep.status = falcon.HTTP_400
+                        return
                     rep.set_header('Content-Type', "text/event-stream")
                     rep.status = falcon.HTTP_200
                     rep.stream = QryRpyMailboxIterable(mbx=self.mbx, cues=self.qrycues, said=serder.said)
@@ -986,7 +989,12 @@ class QueryCues:
         timeout (float): seconds a cue waits to be claimed, and a stream waits
             for its cue
     """
-    Timeout = 300  # seconds, as Kevery.TimeoutQNF: a query can wait that long in escrow
+    # Seconds, as Kevery.TimeoutQNF: a query can wait that long in escrow
+    # before it is answered, so a shorter timeout could drop the answer to a
+    # query whose stream is still open. keripy's Poller gives up after 30 s,
+    # but other clients may hold a stream longer. HttpEnd.TimeoutQNF is not
+    # read anywhere and does not bound this.
+    Timeout = 300
 
     def __init__(self, timeout=None):
         """
@@ -1012,6 +1020,8 @@ class QueryCues:
     def claim(self, said):
         """Remove and return the oldest cue answering query said, or None"""
         self.prune(time.monotonic())
+        if not isinstance(said, str):
+            return None
         queued = self.cues.get(said)
         if not queued:
             return None
@@ -1063,6 +1073,8 @@ class QryRpyMailboxIterable:
             if self.start is None:
                 self.start = now
             cue = self.cues.claim(self.said)
+            if cue is not None and cue.get("kin") != "stream":
+                raise StopIteration  # answered, but not with a stream
             if cue is not None:
                 self.iter = iter(MailboxIterable(mbx=self.mbx, pre=cue["pre"], topics=cue["topics"],
                                                  retry=self.retry))

@@ -19,7 +19,7 @@ from hio.help import decking
 from keri.kering import Schemes, Vrsn_1_0, Vrsn_2_0, Kinds, Ilks, Roles
 from keri.core import SerderKERI, Salter, Kevery, Parser
 from keri.db import basing
-from keri.app import (MailboxIterable, QryRpyMailboxIterable, QueryCues,
+from keri.app import (MailboxIterable, QryRpyMailboxIterable, QueryCues, HttpEnd,
                       QueryEnd, Mailboxer, Receiptor,
                       setupWitness, createHttpServer, openHab, openHby,
                       ReceiptEnd, CESR_CONTENT_TYPE, CESR_DESTINATION_HEADER)
@@ -311,6 +311,39 @@ def test_qrymailbox_iter_ends_without_cue():
     cues.timeout = 0
     with pytest.raises(StopIteration):
         next(mb)
+
+
+
+def test_qrymailbox_iter_ends_on_non_stream_cue():
+    cues = QueryCues()
+    cue = _streamCue("mine")
+    cue["kin"] = "invalid"
+    cues.append(cue)
+    mb = QryRpyMailboxIterable(mbx=Mailboxer(temp=True), cues=cues, said="mine")
+    with pytest.raises(StopIteration):
+        next(mb)
+
+
+def test_mbx_query_with_non_string_said_refused():
+    """An mbx query whose said is not a string is refused rather than
+    opening a stream that would fail on every tick."""
+    with openHab(name="test", transferable=True, temp=True, salt=b'0123456789abcdef',
+                 version=Vrsn_1_0, kind=Kinds.json) as (hby, hab):
+        qry = hab.query(pre=hab.pre, src=hab.pre, route="mbx", version=Vrsn_1_0,
+                        kind=Kinds.json)
+        sad = SerderKERI(raw=qry).sad
+        sad["d"] = ["not", "a", "said"]
+        attachment = bytes(qry[SerderKERI(raw=qry).size:]).decode("utf-8")
+
+        app = falcon.App()
+        cues = QueryCues(timeout=0)  # an unguarded stream ends at once, not in 300 s
+        app.add_route("/", HttpEnd(mbx=Mailboxer(temp=True), qrycues=cues))
+        client = testing.TestClient(app)
+        rep = client.simulate_post("/", body=json.dumps(sad).encode("utf-8"),
+                                   headers={"Content-Type": CESR_CONTENT_TYPE,
+                                            CESR_ATTACHMENT_HEADER: attachment})
+        assert rep.status_code == 400
+        assert cues.claim(["not", "a", "said"]) is None
 
 
 def test_wit_query_ends(seeder, witnessPorter):
