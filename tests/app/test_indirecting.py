@@ -19,7 +19,7 @@ from hio.help import decking
 from keri.kering import Schemes, Vrsn_1_0, Vrsn_2_0, Kinds, Ilks, Roles
 from keri.core import SerderKERI, Salter, Kevery, Parser
 from keri.db import basing
-from keri.app import (MailboxIterable, QryRpyMailboxIterable,
+from keri.app import (MailboxIterable, QryRpyMailboxIterable, QueryCues,
                       QueryEnd, Mailboxer, Receiptor,
                       setupWitness, createHttpServer, openHab, openHby,
                       ReceiptEnd, CESR_CONTENT_TYPE, CESR_DESTINATION_HEADER)
@@ -120,7 +120,7 @@ def test_qrymailbox_iter():
         qry = hab.query(pre=hab.pre, src=hab.pre, route="/mbx", version=Vrsn_1_0, kind=Kinds.json)
         srdr = SerderKERI(raw=qry)
 
-        cues = decking.Deck()
+        cues = QueryCues()
         mbx = Mailboxer(temp=True)
         mb = QryRpyMailboxIterable(mbx=mbx, cues=cues, said=srdr.said, retry=1000)
 
@@ -132,13 +132,13 @@ def test_qrymailbox_iter():
         assert val == b''
         assert mb.iter is None
 
-        # A cue with the wrong said still returns nothing and recues the cue
+        # A cue for another query returns nothing and stays for its own stream
         cues.append(dict(kin="stream", serder=icpSrdr))
         val = next(mbi)
         assert val == b''
         assert len(cues) == 1
         assert mb.iter is None
-        cues.popleft()
+        assert cues.claim(icpSrdr.said) is not None
 
         cues.append(dict(kin="stream", pre=hab.pre, serder=srdr,
                          topics={"/receipt": 0, "/challenge": 1, "/multisig": 0}))
@@ -203,7 +203,7 @@ def test_qrymailbox_iter_v2():
         assert cache.mdt == srdr.stamp
         assert cache.d == 1000
 
-        cues = decking.Deck()
+        cues = QueryCues()
         mbx = Mailboxer(temp=True)
         mb = QryRpyMailboxIterable(mbx=mbx, cues=cues, said=srdr.said, retry=1000)
 
@@ -215,13 +215,13 @@ def test_qrymailbox_iter_v2():
         assert val == b''
         assert mb.iter is None
 
-        # A cue with the wrong said still returns nothing and recues the cue
+        # A cue for another query returns nothing and stays for its own stream
         cues.append(dict(kin="stream", serder=icpSrdr))
         val = next(mbi)
         assert val == b''
         assert len(cues) == 1
         assert mb.iter is None
-        cues.popleft()
+        assert cues.claim(icpSrdr.said) is not None
 
         cues.append(dict(kin="stream", pre=hab.pre, serder=srdr, topics=topics))
         val = next(mbi)
@@ -244,6 +244,73 @@ def test_qrymailbox_iter_v2():
         mb.iter.TimeoutMBX = 0  # Force the iter to timeout
         with pytest.raises(StopIteration):
             next(mbi)
+
+
+class _Said:
+    def __init__(self, said):
+        self.said = said
+
+
+def _streamCue(said):
+    return dict(kin="stream", pre="EA3mbE6upuYnFlx68GmLYCQd7cCcwG_AtHM6dW_GT068",
+                serder=_Said(said), topics={"/receipt": 0})
+
+
+def test_query_cues_drop_unclaimed():
+    """Cues nobody claims are dropped once older than the timeout, so the
+    store stays bounded while no stream is open."""
+    cues = QueryCues(timeout=30)
+    for i in range(500):
+        cues.append(_streamCue(f"stale{i}"))
+    later = time.monotonic() + 31
+    cues.prune(later)
+    assert len(cues) == 0
+    assert not cues.stamps
+
+    cues.append(_streamCue("young"))
+    cues.prune(time.monotonic())
+    assert len(cues) == 1
+
+
+def test_query_cues_claim_own_cue_only():
+    """A stream claims its own cue however many others are queued, and a
+    claimed cue is not dropped again later."""
+    cues = QueryCues(timeout=30)
+    for i in range(500):
+        cues.append(_streamCue(f"other{i}"))
+    cues.append(_streamCue("mine"))
+    cues.append(_streamCue("mine"))  # the same query answered twice
+
+    assert cues.claim("mine")["serder"].said == "mine"
+    assert len(cues) == 501
+    assert cues.claim("nobody") is None
+    cues.prune(time.monotonic() + 31)
+    assert len(cues) == 0
+    assert cues.claim("mine") is None
+
+
+def test_qrymailbox_iter_claims_cue_behind_others():
+    cues = QueryCues()
+    for i in range(500):
+        cues.append(_streamCue(f"other{i}"))
+    cues.append(_streamCue("mine"))
+    mb = QryRpyMailboxIterable(mbx=Mailboxer(temp=True), cues=cues, said="mine",
+                               retry=1000)
+
+    assert next(mb) == b''
+    assert mb.iter is not None
+    assert len(cues) == 500
+    assert next(mb) == b'retry: 1000\n\n'
+
+
+def test_qrymailbox_iter_ends_without_cue():
+    """A stream whose cue never arrives ends instead of waiting forever."""
+    cues = QueryCues(timeout=30)
+    mb = QryRpyMailboxIterable(mbx=Mailboxer(temp=True), cues=cues, said="mine")
+    assert next(mb) == b''
+    cues.timeout = 0
+    with pytest.raises(StopIteration):
+        next(mb)
 
 
 def test_wit_query_ends(seeder, witnessPorter):
