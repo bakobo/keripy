@@ -11,6 +11,7 @@ import falcon
 import time
 import sys
 import traceback
+from collections import deque
 from ordered_set import OrderedSet as oset
 
 from hio.base import doing
@@ -167,7 +168,7 @@ class WitnessStart(doing.DoDoer):
         self.tvy = tvy
         self.rvy = rvy
         self.exc = exc
-        self.queries = queries if queries is not None else decking.Deck()
+        self.queries = queries if queries is not None else QueryCues()
         self.replies = replies if replies is not None else decking.Deck()
         self.responses = responses if responses is not None else decking.Deck()
         self.cues = cues if cues is not None else decking.Deck()
@@ -861,11 +862,11 @@ class HttpEnd:
         Parameters
              rxbs (bytearray): output queue of bytes for message processing
              mbx (Mailboxer): Mailbox storage
-             qrycues (Deck): inbound qry response queues"""
+             qrycues (QueryCues): cues answering mbx queries"""
         self.rxbs = rxbs if rxbs is not None else bytearray()
 
         self.mbx = mbx
-        self.qrycues = qrycues if qrycues is not None else decking.Deck()
+        self.qrycues = qrycues if qrycues is not None else QueryCues()
 
     def on_post(self, req, rep):
         """
@@ -968,31 +969,107 @@ class HttpEnd:
         rep.status = falcon.HTTP_204
 
 
+class QueryCues:
+    """Cues answering mbx queries, each held until the stream for its query claims it
+
+    A witness makes a cue for every mbx query it accepts, whether or not a
+    stream is waiting for it: the query may have come by PUT or TCP, or its
+    client may have hung up. A cue nobody claims is dropped after .timeout
+    seconds, so the store stays bounded. A stream's request precedes its cue,
+    so a stream still waiting for a dropped cue has itself timed out.
+
+    Cues are keyed by query SAID so a stream claims its own without looking
+    at anyone else's, and kept in arrival order so stale ones are dropped
+    from the front.
+
+    Attributes:
+        timeout (float): seconds a cue waits to be claimed, and a stream waits
+            for its cue
+    """
+    Timeout = 300  # seconds, as Kevery.TimeoutQNF: a query can wait that long in escrow
+
+    def __init__(self, timeout=None):
+        """
+        Parameters:
+            timeout (float|None): seconds before an unclaimed cue is dropped,
+                default .Timeout
+        """
+        self.timeout = timeout if timeout is not None else self.Timeout
+        self.cues = {}  # query said -> deque of (stamp, cue), oldest first
+        self.stamps = deque()  # (stamp, said) for every cue, in arrival order
+
+    def __len__(self):
+        return sum(len(queued) for queued in self.cues.values())
+
+    def append(self, cue):
+        """Add cue, a stream cue answering the query cue["serder"]"""
+        now = time.monotonic()
+        self.prune(now)
+        said = cue["serder"].said
+        self.cues.setdefault(said, deque()).append((now, cue))
+        self.stamps.append((now, said))
+
+    def claim(self, said):
+        """Remove and return the oldest cue answering query said, or None"""
+        self.prune(time.monotonic())
+        queued = self.cues.get(said)
+        if not queued:
+            return None
+        _, cue = queued.popleft()
+        if not queued:
+            del self.cues[said]
+        return cue
+
+    def prune(self, now):
+        """Drop cues older than .timeout as of now"""
+        cutoff = now - self.timeout
+        while self.stamps and self.stamps[0][0] <= cutoff:
+            _, said = self.stamps.popleft()
+            queued = self.cues.get(said)
+            while queued and queued[0][0] <= cutoff:  # a claimed cue is already gone
+                queued.popleft()
+                logger.debug("Dropped unclaimed mbx query cue for said=%s", said)
+            if queued is not None and not queued:
+                del self.cues[said]
+
+
 class QryRpyMailboxIterable:
+    """Waits for the cue answering one mbx query, then streams that mailbox
+
+    Ends without streaming if the cue has not come within cues.timeout.
+    """
 
     def __init__(self, cues, mbx, said, retry=5000):
+        """
+        Parameters:
+            cues (QueryCues): cues answering mbx queries
+            mbx (Mailboxer): mailbox storage
+            said (str): SAID of the mbx query this stream answers
+            retry (int): SSE retry in milliseconds
+        """
         self.mbx = mbx
         self.retry = retry
         self.cues = cues
         self.said = said
         self.iter = None
+        self.start = None
 
     def __iter__(self):
         return self
 
     def __next__(self):
         if self.iter is None:
-            if self.cues:
-                cue = self.cues.pull()
-                serder = cue["serder"]
-                if serder.said == self.said:
-                    kin = cue["kin"]
-                    if kin == "stream":
-                        self.iter = iter(MailboxIterable(mbx=self.mbx, pre=cue["pre"], topics=cue["topics"],
-                                                         retry=self.retry))
-                else:
-                    self.cues.append(cue)
-
+            now = time.monotonic()
+            if self.start is None:
+                self.start = now
+            cue = self.cues.claim(self.said)
+            if cue is not None:
+                self.iter = iter(MailboxIterable(mbx=self.mbx, pre=cue["pre"], topics=cue["topics"],
+                                                 retry=self.retry))
+            elif now - self.start >= self.cues.timeout:
+                logger.info("No answer to mbx query said=%s within %ss, ending stream",
+                            self.said, self.cues.timeout)
+                raise StopIteration
             return b''
 
         return next(self.iter)
