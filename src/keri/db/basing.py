@@ -1964,16 +1964,18 @@ class Baser(LMDBer):
         specific anchored event seal of namedtuple SealEvent type that matches
         the provided seal in dict form and is also fully witnessed.
         Searchs from provided sn forward (default = 0).
-        Searches only last events in KEL of pre so does not include disputed
-        and/or superseded events.
+        Searches only the last event at each sn in KEL of pre, so does not
+        include disputed or superseded events at sns the accepted KEL has
+        reached. But an event that a superseding recovery displaced, and that
+        is still the last event stored at an sn above the latest accepted
+        event, is searched too, as it always has been. That is a known defect.
 
         Answers from an in memory SealIndex of the KEL up to its latest
         accepted event instead of walking it, so the cost of a lookup does not
-        grow with the length of the KEL. Any last events stored above the
-        latest accepted event, which a superseding recovery leaves behind, are
-        still walked, so the answer is the same as walking the whole KEL. The
-        walk is also used when the KEL has no Kever or the seal's d is not a
-        str. Seal entries that are not dicts are skipped.
+        grow with the length of the KEL. Last events stored above the latest
+        accepted event are walked, usually none. The walk is also used when
+        the KEL has no Kever or the seal's d is not a str. An 'a' field that is
+        not a list, and seal entries that are not dicts, are skipped.
 
         Returns:
             srdr (Serder): instance of the first event with the matching
@@ -2030,14 +2032,17 @@ class Baser(LMDBer):
     @staticmethod
     def _GenEventSeals(srdr):
         """Generate the anchored seals of srdr in dict form that have exactly
-        the fields of SealEvent. Entries that are not dicts are skipped.
+        the fields of SealEvent. An 'a' field that is not a list, and entries
+        that are not dicts, are skipped.
 
         Parameters:
             srdr (Serder): key event
         """
         from ..core.structing import SealEvent  # local to avoid import cycle
 
-        for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
+        if not isinstance(seals := srdr.seals, list):  # None when 'a' missing
+            return
+        for eseal in seals:
             if isinstance(eseal, dict) and tuple(eseal) == SealEvent._fields:
                 yield eseal
 

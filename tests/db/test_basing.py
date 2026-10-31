@@ -3034,6 +3034,15 @@ class _Controller:
         return self._accept(interact(pre=self.pre, dig=prior.said,
                                      sn=prior.sn + 1, data=data or [], **self.kwa))
 
+    def interactWithA(self, a):
+        """Interaction whose 'a' field is a, which the builder would refuse
+        unless a is a list but which nothing checks on receipt."""
+        prior = self.serders[-1]
+        sad = dict(interact(pre=self.pre, dig=prior.said, sn=prior.sn + 1,
+                            **self.kwa).sad)
+        sad["a"] = a
+        return self._accept(SerderKERI(sad=sad, makify=True))
+
     def rotate(self, data=None, sn=None):
         """Rotate at the next sn, or at sn to supersede the interaction there."""
         sn = len(self.serders) if sn is None else sn
@@ -3194,10 +3203,22 @@ def test_fetch_last_sealing_event_by_event_seal_after_recovery():
             assert (got and got.said) == (want and want.said), seal
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[1]) is None
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]).said == recovery.said
-        # The superseded ixn at sn 3 is still the last event stored at sn 3, so
-        # the walk finds seals[2] there, and so does the index. That is main's
-        # behaviour, kept here; whether it should be is a separate question.
-        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[2]).sn == 3
+
+
+@pytest.mark.xfail(strict=True, reason="known defect inherited from the walk: "
+                   "an event superseded by recovery, left above the recovered tip, "
+                   "is still returned as the sealing event")
+def test_fetch_last_sealing_event_by_event_seal_ignores_superseded_leftovers():
+    """A seal anchored only in an event that a recovery rotation superseded
+    is not found, even while that event is still the last one stored at an sn
+    the recovered KEL has not reached."""
+    with openDB(name="sealing-leftovers") as db:
+        ctl = _Controller(db)
+        seals = [_eventSeal(n) for n in range(3)]
+        for n in range(3):
+            ctl.interact(data=[seals[n]])  # sn 1 to 3
+        ctl.rotate(sn=2)  # supersedes sn 2 and 3, leaving 3 behind
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[2]) is None
 
 
 def test_fetch_last_sealing_event_by_event_seal_after_recovery_appends():
@@ -3253,6 +3274,14 @@ def test_fetch_last_sealing_event_by_event_seal_skips_malformed_seals():
         ctl.interact(data=["isd"])
         assert db.evts.get(keys=(ctl.pre, ctl.serders[1].said)).seals == ["isd"]
         ctl.interact(data=[seal])
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal).sn == 2
+
+        # nor does an 'a' field that is not a list at all
+        ctl.interactWithA(1)
+        assert db.evts.get(keys=(ctl.pre, ctl.serders[3].said)).seals == 1
+        later = _eventSeal(1)
+        ctl.interact(data=[later])
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=later).sn == 4
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal).sn == 2
 
 
