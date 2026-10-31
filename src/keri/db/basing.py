@@ -1966,10 +1966,13 @@ class Baser(LMDBer):
         Searches only last events in KEL of pre so does not include disputed
         and/or superseded events.
 
-        Answers from an in memory SealIndex of the KEL instead of walking it,
-        so the cost of a lookup does not grow with the length of the KEL.
-        Same answer as the walk, which is still used when the KEL has no
-        Kever or the seal cannot be indexed.
+        Answers from an in memory SealIndex of the KEL up to its latest
+        accepted event instead of walking it, so the cost of a lookup does not
+        grow with the length of the KEL. Any last events stored above the
+        latest accepted event, which a superseding recovery leaves behind, are
+        still walked, so the answer is the same as walking the whole KEL. The
+        walk is also used when the KEL has no Kever or the seal cannot be
+        indexed. Seal entries that are not dicts are skipped.
 
         Returns:
             srdr (Serder): instance of the first event with the matching
@@ -2008,12 +2011,11 @@ class Baser(LMDBer):
                 continue
             if not (srdr := self.evts.get(keys=(pre, dig))):
                 continue
-            for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
-                if tuple(eseal) == SealEvent._fields:
-                    eseal = SealEvent(**eseal)  # convert to namedtuple
-                    if seal == eseal and self.fullyWitnessed(srdr):
-                        return srdr
-        return None
+            if self._anchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
+                return srdr
+
+        # superseded leftovers above latest accepted event, usually none
+        return self._walkLastSealingEventByEventSeal(pre, seal, max(sn, kever.sn + 1))
 
     def _walkLastSealingEventByEventSeal(self, pre, seal, sn=0):
         """
@@ -2026,42 +2028,66 @@ class Baser(LMDBer):
             seal (SealEvent): seal to find in anchored seals list of each event
             sn (int): beginning sn to search
         """
+        for srdr in self.getEvtLastPreIter(pre=pre, sn=sn):  # no disputed or superseded
+            if self._anchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
+                return srdr
+        return None
+
+    @staticmethod
+    def _eventSeals(srdr):
+        """
+        Returns generator of anchored seals of srdr in dict form that have
+        exactly the fields of SealEvent.
+
+        Parameters:
+            srdr (Serder): key event
+        """
         from ..core.structing import SealEvent
 
-        for srdr in self.getEvtLastPreIter(pre=pre, sn=sn):  # no disputed or superseded
-            for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
-                if tuple(eseal) == SealEvent._fields:
-                    eseal = SealEvent(**eseal)  # convert to namedtuple
-                    if seal == eseal and self.fullyWitnessed(srdr):
-                        return srdr
-        return None
+        for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
+            if isinstance(eseal, dict) and tuple(eseal) == SealEvent._fields:
+                yield eseal
+
+    def _anchorsEventSeal(self, srdr, seal):
+        """
+        Returns True if srdr anchors SealEvent seal, False otherwise.
+
+        Parameters:
+            srdr (Serder): key event
+            seal (SealEvent): seal to find in anchored seals list of srdr
+        """
+        from ..core.structing import SealEvent
+
+        return any(seal == SealEvent(**eseal) for eseal in self._eventSeals(srdr))
 
     def _sealIndex(self, pre, kever):
         """
-        Returns SealIndex for KEL of pre brought up to date with the db.
+        Returns SealIndex for KEL of pre brought up to date with the db through
+        the latest accepted event kever.sn.
 
-        Extends the index over events added since it was last used. Rebuilds
+        Extends the index over events accepted since it was last used. Rebuilds
         it from sn 0 when the KEL beneath it may have been rewritten, which
         only a new establishment event can do (superseding recovery), or when
         the last event at its high water mark is no longer the one indexed.
+        A rebuild reads the whole KEL once, which happens after each reopen
+        and each establishment event of pre.
 
         Parameters:
             pre (str): identifier of the KEL
             kever (Kever): current key state of pre
         """
-        from ..core.structing import SealEvent
-
         est = (kever.lastEst.s, kever.lastEst.d)
         index = self._sealIdxs.get(pre)
-        if (index is None or index.est != est or
+        if (index is None or index.est != est or index.on > kever.sn or
                 (index.on >= 0 and self.kels.getLast(keys=pre, on=index.on) != index.dig)):
             index = self._sealIdxs[pre] = SealIndex(est=est)
 
         for _, on, dig in self.kels.getLastItemIter(keys=pre, on=index.on + 1):
+            if on > kever.sn:  # superseded leftovers are never indexed
+                break
             if srdr := self.evts.get(keys=(pre, dig)):
-                for eseal in srdr.seals or []:
-                    if tuple(eseal) == SealEvent._fields:
-                        index.add(eseal["d"], on)
+                for eseal in self._eventSeals(srdr):
+                    index.add(eseal["d"], on)
             index.on, index.dig = on, dig
         return index
 
@@ -2241,6 +2267,15 @@ class SealIndex:
     seal, keyed by the seal's d field. Built and kept current by
     Baser._sealIndex. Candidates it returns are rechecked against the db by
     the caller, so it only has to never miss an sn, not to be exact.
+
+    Invariant: for every sn in 0 through .on, the last event at sn in the db
+    is the one that was indexed, and so every SealEvent it anchors is in the
+    index. .on never exceeds the latest accepted sn. Only an establishment
+    event can rewrite accepted events below .on, and a changed .est, or a
+    changed last event at .on, discards the index.
+
+    Memory is one entry per anchored SealEvent in the KEL, held until the
+    Baser is reopened.
 
     Attributes:
         est (tuple): (sn, said) of the last establishment event when built

@@ -14,7 +14,7 @@ import pytest
 import lmdb
 from hio.base import doing
 
-from keri.kering import Kinds, Ilks, Vrsn_2_0, versify
+from keri.kering import Kinds, Ilks, Vrsn_1_0, Vrsn_2_0, versify
 from keri.app import openHby
 from keri.core import (Seqner, Diger, Number, Kever, Serder,
                        Signer, Siger, Salter, Dater, Prefixer,
@@ -3006,13 +3006,14 @@ class _Controller:
     """A single-key, unwitnessed controller whose events go straight into a
     Kevery on db, so a test can also write a superseding recovery rotation."""
 
-    def __init__(self, db, salt=b'0123456789abcdef'):
+    def __init__(self, db, salt=b'0123456789abcdef', **kwa):
+        self.kwa = kwa  # version and kind for every event
         self.signers = Salter(raw=salt).signers(count=8, path='seal', temp=True)
         self.kvy = Kevery(db=db, lax=False, local=True)
         self.esn = 0  # index of signer holding the current signing key
         self.serders = []  # accepted event at each sn
         serder = incept(keys=[self.signers[0].verfer.qb64],
-                        ndigs=[Diger(ser=self.signers[1].verfer.qb64b).qb64])
+                        ndigs=[Diger(ser=self.signers[1].verfer.qb64b).qb64], **kwa)
         self._accept(serder)
 
     @property
@@ -3031,7 +3032,7 @@ class _Controller:
     def interact(self, data=None):
         prior = self.serders[-1]
         return self._accept(interact(pre=self.pre, dig=prior.said,
-                                     sn=prior.sn + 1, data=data or []))
+                                     sn=prior.sn + 1, data=data or [], **self.kwa))
 
     def rotate(self, data=None, sn=None):
         """Rotate at the next sn, or at sn to supersede the interaction there."""
@@ -3041,7 +3042,7 @@ class _Controller:
                                    keys=[self.signers[self.esn].verfer.qb64],
                                    dig=self.serders[sn - 1].said,
                                    ndigs=[Diger(ser=self.signers[self.esn + 1].verfer.qb64b).qb64],
-                                   sn=sn, data=data or []))
+                                   sn=sn, data=data or [], **self.kwa))
 
 
 def _eventSeal(n):
@@ -3167,6 +3168,43 @@ def test_fetch_last_sealing_event_by_event_seal_after_recovery():
             assert (got and got.said) == (want and want.said), seal
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[1]) is None
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]).said == recovery.said
+        # The superseded ixn at sn 3 is still the last event stored at sn 3, so
+        # the walk finds seals[2] there, and so does the index. That is main's
+        # behaviour, kept here; whether it should be is a separate question.
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[2]).sn == 3
+
+
+def test_fetch_last_sealing_event_by_event_seal_after_recovery_appends():
+    """Events the recovered KEL appends at sns still holding superseded
+    leftovers are found, though the index had already read past them."""
+    with openDB(name="sealing-recovery-appends") as db:
+        ctl = _Controller(db)
+        seals = [_eventSeal(n) for n in range(8)]
+        for n in range(5):
+            ctl.interact(data=[seals[n]])  # sn 1 to 5
+        ctl.rotate(sn=2)  # supersedes sn 2 to 5, leaving 3 to 5 behind
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[0]).sn == 1
+
+        ctl.interact(data=[seals[5]])  # sn 3, below the leftovers at 4 and 5
+        for seal, sn in ((seals[5], 3), (seals[3], 4), (seals[4], 5)):
+            got = db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal)
+            want = _walkLastSealing(db, ctl.pre, seal)
+            assert got is not None and got.said == want.said and got.sn == sn, seal
+        ctl.interact(data=[seals[6]])  # sn 4, over a leftover
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[6]).sn == 4
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]) is None
+
+
+def test_fetch_last_sealing_event_by_event_seal_skips_malformed_seals():
+    """A seal entry that only looks like a SealEvent's keys, such as the
+    string 'isd', does not stop lookups of the seals after it."""
+    with openDB(name="sealing-malformed") as db:
+        ctl = _Controller(db, version=Vrsn_1_0, kind=Kinds.json)  # keeps a bare str seal
+        seal = _eventSeal(0)
+        ctl.interact(data=["isd"])
+        assert db.evts.get(keys=(ctl.pre, ctl.serders[1].said)).seals == ["isd"]
+        ctl.interact(data=[seal])
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal).sn == 2
 
 
 if __name__ == "__main__":
