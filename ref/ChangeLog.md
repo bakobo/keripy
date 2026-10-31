@@ -32,6 +32,15 @@ now raises a keri.kering error (a KeriError) instead of a raw Python exception.
 Code that catches ValueError or KeyError around these calls should catch the kering error
 named above, or KeriError.
 
+*** Baser.fetchLastSealingEventByEventSeal answers from an in-memory index of each
+KEL's anchored SealEvent seals instead of walking the KEL from sn, so TEL anchor
+discovery and delegation checks no longer cost O(KEL) per lookup. The answer is
+unchanged with one exception: an anchored seal entry that is not a dict but iterates to
+SealEvent's keys (for example the string "isd") used to raise TypeError and is now
+skipped. Kevery.fetchWitnessState and Kevery.fetchEstEvent read the last establishment
+event of the current key state directly when sn is at or after it, instead of walking
+back to it.
+
 *** New Parser.parseOneBare: like parseOne, but raises errors to the caller instead of
 logging them, for callers that are not internet-facing services and need to know why a
 msg failed. Intake errors raised while extracting (ExtractionError, ValidationError) are

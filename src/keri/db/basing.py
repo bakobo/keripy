@@ -6,6 +6,7 @@ keri.db.basing module
 import importlib
 import os
 import shutil
+from bisect import bisect_left
 from collections import namedtuple
 from contextlib import contextmanager
 import lmdb
@@ -1971,8 +1972,8 @@ class Baser(LMDBer):
         grow with the length of the KEL. Any last events stored above the
         latest accepted event, which a superseding recovery leaves behind, are
         still walked, so the answer is the same as walking the whole KEL. The
-        walk is also used when the KEL has no Kever or the seal cannot be
-        indexed. Seal entries that are not dicts are skipped.
+        walk is also used when the KEL has no Kever or the seal's d is not a
+        str. Seal entries that are not dicts are skipped.
 
         Returns:
             srdr (Serder): instance of the first event with the matching
@@ -1995,31 +1996,24 @@ class Baser(LMDBer):
 
         if hasattr(pre, 'decode'):
             pre = pre.decode("utf-8")
-        kever = self.kevers[pre] if pre in self.kevers else None  # read through
-        try:
-            hash(seal.d)
-        except TypeError:  # unhashable so cannot be indexed
-            kever = None
-        if kever is None:
+        if not isinstance(seal.d, str) or pre not in self.kevers:  # reads through
             return self._walkLastSealingEventByEventSeal(pre, seal, sn)
+        kever = self.kevers[pre]
 
-        for on in self._sealIndex(pre, kever).sns(seal.d):
-            if on < sn:
-                continue
+        for on in self._refreshSealIndex(pre, kever).find(seal.d, sn):
             # index may be stale for sn so recheck the last event at sn now
             if not (dig := self.kels.getLast(keys=pre, on=on)):
                 continue
             if not (srdr := self.evts.get(keys=(pre, dig))):
                 continue
-            if self._anchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
+            if self._AnchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
                 return srdr
 
         # superseded leftovers above latest accepted event, usually none
         return self._walkLastSealingEventByEventSeal(pre, seal, max(sn, kever.sn + 1))
 
     def _walkLastSealingEventByEventSeal(self, pre, seal, sn=0):
-        """
-        Forward walk of last events in KEL of pre from sn for the first fully
+        """Forward walk of last events in KEL of pre from sn for the first fully
         witnessed event that anchors SealEvent seal. See
         .fetchLastSealingEventByEventSeal.
 
@@ -2029,48 +2023,46 @@ class Baser(LMDBer):
             sn (int): beginning sn to search
         """
         for srdr in self.getEvtLastPreIter(pre=pre, sn=sn):  # no disputed or superseded
-            if self._anchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
+            if self._AnchorsEventSeal(srdr, seal) and self.fullyWitnessed(srdr):
                 return srdr
         return None
 
     @staticmethod
-    def _eventSeals(srdr):
-        """
-        Returns generator of anchored seals of srdr in dict form that have
-        exactly the fields of SealEvent.
+    def _GenEventSeals(srdr):
+        """Generate the anchored seals of srdr in dict form that have exactly
+        the fields of SealEvent. Entries that are not dicts are skipped.
 
         Parameters:
             srdr (Serder): key event
         """
-        from ..core.structing import SealEvent
+        from ..core.structing import SealEvent  # local to avoid import cycle
 
         for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
             if isinstance(eseal, dict) and tuple(eseal) == SealEvent._fields:
                 yield eseal
 
-    def _anchorsEventSeal(self, srdr, seal):
-        """
-        Returns True if srdr anchors SealEvent seal, False otherwise.
+    @staticmethod
+    def _AnchorsEventSeal(srdr, seal):
+        """Returns True if srdr anchors SealEvent seal, False otherwise.
 
         Parameters:
             srdr (Serder): key event
             seal (SealEvent): seal to find in anchored seals list of srdr
         """
-        from ..core.structing import SealEvent
+        from ..core.structing import SealEvent  # local to avoid import cycle
 
-        return any(seal == SealEvent(**eseal) for eseal in self._eventSeals(srdr))
+        return any(seal == SealEvent(**eseal) for eseal in Baser._GenEventSeals(srdr))
 
-    def _sealIndex(self, pre, kever):
-        """
-        Returns SealIndex for KEL of pre brought up to date with the db through
+    def _refreshSealIndex(self, pre, kever):
+        """Returns SealIndex for KEL of pre brought up to date with the db through
         the latest accepted event kever.sn.
 
         Extends the index over events accepted since it was last used. Rebuilds
         it from sn 0 when the KEL beneath it may have been rewritten, which
-        only a new establishment event can do (superseding recovery), or when
-        the last event at its high water mark is no longer the one indexed.
-        A rebuild reads the whole KEL once, which happens after each reopen
-        and each establishment event of pre.
+        only a new establishment event at or below its high water mark can do
+        (superseding recovery), or when the last event at its high water mark
+        is no longer the one indexed. A rebuild reads the whole KEL once, which
+        happens after each reopen and each superseding recovery of pre.
 
         Parameters:
             pre (str): identifier of the KEL
@@ -2078,16 +2070,19 @@ class Baser(LMDBer):
         """
         est = (kever.lastEst.s, kever.lastEst.d)
         index = self._sealIdxs.get(pre)
-        if (index is None or index.est != est or index.on > kever.sn or
+        if (index is None or index.on > kever.sn or
+                (index.est != est and est[0] <= index.on) or
                 (index.on >= 0 and self.kels.getLast(keys=pre, on=index.on) != index.dig)):
-            index = self._sealIdxs[pre] = SealIndex(est=est)
+            index = self._sealIdxs[pre] = SealIndex()
+        index.est = est
 
         for _, on, dig in self.kels.getLastItemIter(keys=pre, on=index.on + 1):
             if on > kever.sn:  # superseded leftovers are never indexed
                 break
             if srdr := self.evts.get(keys=(pre, dig)):
-                for eseal in self._eventSeals(srdr):
-                    index.add(eseal["d"], on)
+                for eseal in self._GenEventSeals(srdr):
+                    if isinstance(eseal["d"], str):
+                        index.add(eseal["d"], on)
             index.on, index.dig = on, dig
         return index
 
@@ -2262,45 +2257,45 @@ class Baser(LMDBer):
 
 
 class SealIndex:
-    """
-    In memory index of the sns in one KEL whose last event anchors a SealEvent
-    seal, keyed by the seal's d field. Built and kept current by
-    Baser._sealIndex. Candidates it returns are rechecked against the db by
-    the caller, so it only has to never miss an sn, not to be exact.
+    """In memory index of the sns in one KEL whose last event anchors a
+    SealEvent seal, keyed by the seal's d field. Built and kept current by
+    Baser._refreshSealIndex. Candidates it returns are rechecked against the db
+    by the caller, so it only has to never miss an sn, not to be exact.
 
     Invariant: for every sn in 0 through .on, the last event at sn in the db
     is the one that was indexed, and so every SealEvent it anchors is in the
     index. .on never exceeds the latest accepted sn. Only an establishment
-    event can rewrite accepted events below .on, and a changed .est, or a
-    changed last event at .on, discards the index.
+    event at or below .on can rewrite accepted events at or below .on, and
+    such an event, or a changed last event at .on, discards the index.
 
     Memory is one entry per anchored SealEvent in the KEL, held until the
     Baser is reopened.
 
     Attributes:
-        est (tuple): (sn, said) of the last establishment event when built
+        est (tuple|None): (sn, said) of the last establishment event when last
+            brought up to date
         on (int): highest sn indexed, -1 when none
         dig (str|None): said of the last event at .on when indexed
     """
 
-    def __init__(self, est):
-        self.est = est
+    def __init__(self):
+        self.est = None
         self.on = -1
         self.dig = None
         self._sns = {}  # seal d field to ascending list of sns
 
     def add(self, d, on):
         """Record that the last event at on anchors a SealEvent with d."""
-        try:
-            sns = self._sns.setdefault(d, [])
-        except TypeError:  # unhashable never matches a hashable seal
-            return
+        sns = self._sns.setdefault(d, [])
         if not sns or sns[-1] != on:
             sns.append(on)
 
-    def sns(self, d):
-        """Returns ascending list of indexed sns anchoring a SealEvent with d."""
-        return self._sns.get(d, [])
+    def find(self, d, sn=0):
+        """Returns ascending list of indexed sns at or after sn anchoring a
+        SealEvent with d.
+        """
+        sns = self._sns.get(d, [])
+        return sns[bisect_left(sns, sn):]
 
 
 class BaserDoer(doing.Doer):

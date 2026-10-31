@@ -3147,6 +3147,32 @@ def test_fetch_last_sealing_event_by_event_seal_reads_bounded(monkeypatch):
         assert lateMiss == earlyMiss, f"a miss read {earlyMiss} then {lateMiss}"
 
 
+def test_fetch_last_sealing_event_by_event_seal_reads_bounded_across_rotations(monkeypatch):
+    """A rotation appended after the indexed events rewrites none of them, so
+    the first lookup after it reads as many key events at sn 50 as at sn 10."""
+    with openDB(name="sealing-bound-rotation") as db:
+        ctl = _Controller(db)
+        reads = _Reads(db, monkeypatch)
+
+        def rotateAnchorAndFind(n):
+            db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=_eventSeal(n))  # warm
+            ctl.rotate()
+            seal = _eventSeal(n + 1)
+            ctl.interact(data=[seal])
+            return reads.during(
+                lambda: db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal))
+
+        for n in range(10):
+            ctl.interact(data=[_eventSeal(n)])
+        early, found = rotateAnchorAndFind(10)
+        assert found.sn == 12
+        for n in range(12, 50):
+            ctl.interact(data=[_eventSeal(n)])
+        late, found = rotateAnchorAndFind(50)
+        assert found.sn == 52
+        assert late == early, f"read {early} key events at sn 12 and {late} at sn 52"
+
+
 def test_fetch_last_sealing_event_by_event_seal_after_recovery():
     """A recovery rotation that supersedes events already indexed changes the
     answer exactly as it changes the walk's."""
@@ -3193,6 +3219,29 @@ def test_fetch_last_sealing_event_by_event_seal_after_recovery_appends():
         ctl.interact(data=[seals[6]])  # sn 4, over a leftover
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[6]).sn == 4
         assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]) is None
+
+
+def test_fetch_last_sealing_event_by_event_seal_after_recovery_then_rotation():
+    """A recovery below the index's high-water mark is noticed even when an
+    ordinary rotation above the mark is the last establishment event by the
+    next lookup."""
+    with openDB(name="sealing-recovery-rotation") as db:
+        ctl = _Controller(db)
+        seals = [_eventSeal(n) for n in range(8)]
+        for n in range(5):
+            ctl.interact(data=[seals[n]])  # sn 1 to 5
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]).sn == 4
+        ctl.rotate(sn=2)  # supersedes sn 2 to 5
+        for n in (5, 6, 7):
+            ctl.interact(data=[seals[n]])  # sn 3 to 5
+        ctl.rotate()  # sn 6, above the old mark
+        assert db.kevers[ctl.pre].lastEst.s == 6
+        for seal in seals:
+            got = db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal)
+            want = _walkLastSealing(db, ctl.pre, seal)
+            assert (got and got.said) == (want and want.said), seal
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]) is None
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[6]).sn == 4
 
 
 def test_fetch_last_sealing_event_by_event_seal_skips_malformed_seals():
