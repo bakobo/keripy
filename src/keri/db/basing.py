@@ -948,6 +948,7 @@ class Baser(LMDBer):
         self.groups = oset()  # group hab ids
         self._kevers = statedict()
         self._kevers.db = self  # assign db for read through cache of kevers
+        self._sealIdxs = {}  # SealIndex per prefix, rebuilt from db on demand
 
         if (mapSize := os.getenv(KERIBaserMapSizeKey)) is not None:
             try:
@@ -985,6 +986,7 @@ class Baser(LMDBer):
         from ..core import coring, indexing
 
         super(Baser, self).reopen(**kwa)
+        self._sealIdxs = {}  # in memory only so may not match reopened db
 
         # Create by opening first time named sub DBs within main DB instance
         # Names end with "." as sub DB name must include a non Base64 character
@@ -1964,6 +1966,11 @@ class Baser(LMDBer):
         Searches only last events in KEL of pre so does not include disputed
         and/or superseded events.
 
+        Answers from an in memory SealIndex of the KEL instead of walking it,
+        so the cost of a lookup does not grow with the length of the KEL.
+        Same answer as the walk, which is still used when the KEL has no
+        Kever or the seal cannot be indexed.
+
         Returns:
             srdr (Serder): instance of the first event with the matching
                 anchoring SealEvent seal,
@@ -1983,6 +1990,44 @@ class Baser(LMDBer):
 
         seal = SealEvent(**seal)  #convert to namedtuple
 
+        if hasattr(pre, 'decode'):
+            pre = pre.decode("utf-8")
+        kever = self.kevers[pre] if pre in self.kevers else None  # read through
+        try:
+            hash(seal.d)
+        except TypeError:  # unhashable so cannot be indexed
+            kever = None
+        if kever is None:
+            return self._walkLastSealingEventByEventSeal(pre, seal, sn)
+
+        for on in self._sealIndex(pre, kever).sns(seal.d):
+            if on < sn:
+                continue
+            # index may be stale for sn so recheck the last event at sn now
+            if not (dig := self.kels.getLast(keys=pre, on=on)):
+                continue
+            if not (srdr := self.evts.get(keys=(pre, dig))):
+                continue
+            for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
+                if tuple(eseal) == SealEvent._fields:
+                    eseal = SealEvent(**eseal)  # convert to namedtuple
+                    if seal == eseal and self.fullyWitnessed(srdr):
+                        return srdr
+        return None
+
+    def _walkLastSealingEventByEventSeal(self, pre, seal, sn=0):
+        """
+        Forward walk of last events in KEL of pre from sn for the first fully
+        witnessed event that anchors SealEvent seal. See
+        .fetchLastSealingEventByEventSeal.
+
+        Parameters:
+            pre (str): identifier of the KEL to search
+            seal (SealEvent): seal to find in anchored seals list of each event
+            sn (int): beginning sn to search
+        """
+        from ..core.structing import SealEvent
+
         for srdr in self.getEvtLastPreIter(pre=pre, sn=sn):  # no disputed or superseded
             for eseal in srdr.seals or []:  # or [] for seals 'a' field missing
                 if tuple(eseal) == SealEvent._fields:
@@ -1991,7 +2036,34 @@ class Baser(LMDBer):
                         return srdr
         return None
 
+    def _sealIndex(self, pre, kever):
+        """
+        Returns SealIndex for KEL of pre brought up to date with the db.
 
+        Extends the index over events added since it was last used. Rebuilds
+        it from sn 0 when the KEL beneath it may have been rewritten, which
+        only a new establishment event can do (superseding recovery), or when
+        the last event at its high water mark is no longer the one indexed.
+
+        Parameters:
+            pre (str): identifier of the KEL
+            kever (Kever): current key state of pre
+        """
+        from ..core.structing import SealEvent
+
+        est = (kever.lastEst.s, kever.lastEst.d)
+        index = self._sealIdxs.get(pre)
+        if (index is None or index.est != est or
+                (index.on >= 0 and self.kels.getLast(keys=pre, on=index.on) != index.dig)):
+            index = self._sealIdxs[pre] = SealIndex(est=est)
+
+        for _, on, dig in self.kels.getLastItemIter(keys=pre, on=index.on + 1):
+            if srdr := self.evts.get(keys=(pre, dig)):
+                for eseal in srdr.seals or []:
+                    if tuple(eseal) == SealEvent._fields:
+                        index.add(eseal["d"], on)
+            index.on, index.dig = on, dig
+        return index
 
     def fetchLastSealingEventBySeal(self, pre, seal, sn=0):
         """Only searches last event at any sn therefore does not search
@@ -2161,6 +2233,39 @@ class Baser(LMDBer):
                 continue  # skip this event
 
             yield serder  # event as Serder
+
+
+class SealIndex:
+    """
+    In memory index of the sns in one KEL whose last event anchors a SealEvent
+    seal, keyed by the seal's d field. Built and kept current by
+    Baser._sealIndex. Candidates it returns are rechecked against the db by
+    the caller, so it only has to never miss an sn, not to be exact.
+
+    Attributes:
+        est (tuple): (sn, said) of the last establishment event when built
+        on (int): highest sn indexed, -1 when none
+        dig (str|None): said of the last event at .on when indexed
+    """
+
+    def __init__(self, est):
+        self.est = est
+        self.on = -1
+        self.dig = None
+        self._sns = {}  # seal d field to ascending list of sns
+
+    def add(self, d, on):
+        """Record that the last event at on anchors a SealEvent with d."""
+        try:
+            sns = self._sns.setdefault(d, [])
+        except TypeError:  # unhashable never matches a hashable seal
+            return
+        if not sns or sns[-1] != on:
+            sns.append(on)
+
+    def sns(self, d):
+        """Returns ascending list of indexed sns anchoring a SealEvent with d."""
+        return self._sns.get(d, [])
 
 
 class BaserDoer(doing.Doer):

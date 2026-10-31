@@ -22,7 +22,7 @@ from keri.core import (Seqner, Diger, Number, Kever, Serder,
                        Texter, SerderKERI, StateEstEvent,
                        IdrDex, MtrDex, NumDex,
                        exchange, incept, rotate, interact,
-                       Kramer, query, exchept)
+                       Kramer, query, exchept, Kevery)
 
 from keri.core import state as eventState
 from keri.db import (Baser, BaserDoer, Baser, SerderSuber,
@@ -2984,6 +2984,189 @@ def test_semver_dev_tag_comparison():
     # Scenario: complete() should list 1.2.0 migrations when DB is at 1.2.0-dev4
     db_ver = _strip_prerelease("1.2.0-dev4")
     assert semver.compare("1.2.0", db_ver) <= 0  # 0 <= 0, so list it
+
+
+def _walkLastSealing(db, pre, seal, sn=0):
+    """The forward walk fetchLastSealingEventByEventSeal made before it kept a
+    seal index, kept here as the reference its answers must match."""
+    from keri.core import SealEvent
+
+    if tuple(seal) != SealEvent._fields:
+        return None
+    seal = SealEvent(**seal)
+    for srdr in db.getEvtLastPreIter(pre=pre, sn=sn):
+        for eseal in srdr.seals or []:
+            if tuple(eseal) == SealEvent._fields:
+                if seal == SealEvent(**eseal) and db.fullyWitnessed(srdr):
+                    return srdr
+    return None
+
+
+class _Controller:
+    """A single-key, unwitnessed controller whose events go straight into a
+    Kevery on db, so a test can also write a superseding recovery rotation."""
+
+    def __init__(self, db, salt=b'0123456789abcdef'):
+        self.signers = Salter(raw=salt).signers(count=8, path='seal', temp=True)
+        self.kvy = Kevery(db=db, lax=False, local=True)
+        self.esn = 0  # index of signer holding the current signing key
+        self.serders = []  # accepted event at each sn
+        serder = incept(keys=[self.signers[0].verfer.qb64],
+                        ndigs=[Diger(ser=self.signers[1].verfer.qb64b).qb64])
+        self._accept(serder)
+
+    @property
+    def pre(self):
+        return self.serders[0].pre
+
+    def _accept(self, serder):
+        siger = self.signers[self.esn].sign(serder.raw, index=0)
+        self.kvy.processEvent(serder=serder, sigers=[siger])
+        assert self.kvy.db.kels.getLast(keys=self.pre if self.serders else serder.pre,
+                                        on=serder.sn) == serder.said
+        del self.serders[serder.sn:]
+        self.serders.append(serder)
+        return serder
+
+    def interact(self, data=None):
+        prior = self.serders[-1]
+        return self._accept(interact(pre=self.pre, dig=prior.said,
+                                     sn=prior.sn + 1, data=data or []))
+
+    def rotate(self, data=None, sn=None):
+        """Rotate at the next sn, or at sn to supersede the interaction there."""
+        sn = len(self.serders) if sn is None else sn
+        self.esn += 1
+        return self._accept(rotate(pre=self.pre,
+                                   keys=[self.signers[self.esn].verfer.qb64],
+                                   dig=self.serders[sn - 1].said,
+                                   ndigs=[Diger(ser=self.signers[self.esn + 1].verfer.qb64b).qb64],
+                                   sn=sn, data=data or []))
+
+
+def _eventSeal(n):
+    """A distinct SealEvent-shaped seal in dict form."""
+    said = Diger(ser=b"tel-event-%d" % n).qb64
+    return dict(i=Diger(ser=b"registry").qb64, s=f"{n:x}", d=said)
+
+
+class _Reads:
+    """Counts key events read out of db.evts."""
+
+    def __init__(self, db, monkeypatch):
+        self.count = 0
+        original = db.evts.get
+
+        def counting(*pa, **kwa):
+            self.count += 1
+            return original(*pa, **kwa)
+
+        monkeypatch.setattr(db.evts, "get", counting)
+
+    def during(self, act):
+        self.count = 0
+        result = act()
+        return self.count, result
+
+
+def test_fetch_last_sealing_event_by_event_seal_matches_walk():
+    """The indexed lookup gives the forward walk's answer for every seal and
+    start, including seals anchored twice, seals of other shapes, misses, and
+    events added between lookups."""
+    with openDB(name="sealing-walk") as db:
+        ctl = _Controller(db)
+        seals = [_eventSeal(n) for n in range(6)]
+        digest = dict(d=Diger(ser=b"bare").qb64)  # not a SealEvent
+        ctl.interact(data=[seals[0]])
+        ctl.interact(data=[seals[1], digest, seals[2]])
+        ctl.interact(data=[seals[0]])  # anchored a second time
+        ctl.rotate(data=[seals[3]])
+        ctl.interact()
+
+        def same(seal, sn):
+            got = db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal, sn=sn)
+            want = _walkLastSealing(db, ctl.pre, seal, sn)
+            assert (got and got.said) == (want and want.said), (seal, sn)
+            return got
+
+        for sn in range(len(ctl.serders) + 1):
+            for seal in seals:
+                same(seal, sn)
+        assert same(seals[0], 0).sn == 1
+        assert same(seals[0], 2).sn == 3
+        assert same(seals[3], 0).sn == 4
+        assert same(seals[4], 0) is None
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=digest) is None
+
+        # events written after the index was built are found
+        ctl.interact(data=[seals[4]])
+        assert same(seals[4], 0).sn == 6
+        assert same(seals[4], 7) is None
+
+        # a seal that cannot be indexed goes to the walk, an unknown KEL finds nothing
+        assert same(dict(i=seals[0]["i"], s="0", d=[seals[0]["d"]]), 0) is None
+        assert db.fetchLastSealingEventByEventSeal(pre=_eventSeal(9)["d"], seal=seals[0]) is None
+
+        # key state reloaded from the db, as after a restart, gives the same answers
+        db.kevers.clear()
+        assert ctl.pre not in dict.keys(db.kevers)
+        assert same(seals[3], 0).sn == 4
+        assert same(seals[0], 2).sn == 3
+
+
+def test_fetch_last_sealing_event_by_event_seal_reads_bounded(monkeypatch):
+    """THE BOUND. Finding the seal of the newest event, or missing one, reads
+    as many key events at sn 50 as at sn 10, though the KEL has grown by forty
+    events between them."""
+    with openDB(name="sealing-bound") as db:
+        ctl = _Controller(db)
+        reads = _Reads(db, monkeypatch)
+
+        def anchorAndFind(n):
+            seal = _eventSeal(n)
+            ctl.interact(data=[seal])
+            return reads.during(
+                lambda: db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal))
+
+        def miss(n):
+            return reads.during(
+                lambda: db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=_eventSeal(-n)))
+
+        for n in range(10):
+            anchorAndFind(n)
+        early, found = anchorAndFind(10)
+        assert found.sn == 11
+        earlyMiss, _ = miss(1)
+        for n in range(11, 50):
+            anchorAndFind(n)
+        late, found = anchorAndFind(50)
+        assert found.sn == 51
+        lateMiss, _ = miss(2)
+        assert late == early, f"read {early} key events at sn 11 and {late} at sn 51"
+        assert lateMiss == earlyMiss, f"a miss read {earlyMiss} then {lateMiss}"
+
+
+def test_fetch_last_sealing_event_by_event_seal_after_recovery():
+    """A recovery rotation that supersedes events already indexed changes the
+    answer exactly as it changes the walk's."""
+    with openDB(name="sealing-recovery") as db:
+        ctl = _Controller(db)
+        seals = [_eventSeal(n) for n in range(4)]
+        ctl.interact(data=[seals[0]])  # sn 1
+        ctl.interact(data=[seals[1]])  # sn 2
+        ctl.interact(data=[seals[2]])  # sn 3
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[1]).sn == 2
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]) is None
+
+        recovery = ctl.rotate(data=[seals[3]], sn=2)  # supersedes sn 2 and 3
+        assert db.kevers[ctl.pre].lastEst.d == recovery.said
+
+        for seal in seals:
+            got = db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seal)
+            want = _walkLastSealing(db, ctl.pre, seal)
+            assert (got and got.said) == (want and want.said), seal
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[1]) is None
+        assert db.fetchLastSealingEventByEventSeal(pre=ctl.pre, seal=seals[3]).said == recovery.said
 
 
 if __name__ == "__main__":

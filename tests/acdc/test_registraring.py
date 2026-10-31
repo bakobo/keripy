@@ -1067,3 +1067,58 @@ def test_regery_rejects_duplicate_registry_key_creation():
             assert list(rgy.regs.keys()) == [first.regk]
         finally:
             rgy.close()
+
+
+def test_registry_issuance_reads_bounded_key_events(monkeypatch):
+    """Issuing and anchoring a blindable update reads as many of the issuer's
+    key events at sn 50 as at sn 10, though the KEL has grown by forty events
+    between them. Anchor discovery used to walk the KEL from sn 0."""
+    with openHby(name="acdc-registry-bounded",
+                 base="test",
+                 version=Vrsn_2_0) as hby:
+        hab = hby.makeHab(name="test")
+        rgy = Regery(hby=hby, name="acdc-registry-bounded", temp=True)
+        try:
+            registrar = Registrar(rgy=rgy)
+            registry = registrar.makeRegistry(name="bounded", prefix=hab.pre)
+            _anchor(hab, registry, rgy.store.event(registry.regk))
+            acdc = acdcmap(israid=hab.pre,
+                           regid=registry.regk,
+                           attribute=dict(d="", LEI="254900OPPU84GM83MG36"),
+                           iseaid=hab.pre)
+
+            # Count reads of the issuer's key events, armed only around the TEL calls
+            reads = SimpleNamespace(count=0, armed=False)
+            original = hby.db.evts.get
+
+            def counting(keys, *pa, **kwa):
+                if reads.armed and keys[0] in (hab.pre, hab.pre.encode()):
+                    reads.count += 1
+                return original(keys, *pa, **kwa)
+
+            monkeypatch.setattr(hby.db.evts, "get", counting)
+
+            def issueAndAnchor():
+                reads.count, reads.armed = 0, True
+                _, bup = registrar.issue(registry, acdc=acdc, state="issued")
+                registry.processEscrows()  # a drain before the seal lands
+                reads.armed = False
+                seal = dict(i=registry.regk, s=bup.sad["n"], d=bup.said)
+                hab.interact(data=[seal], framed=True, gvrsn=Vrsn_2_0)
+                reads.armed = True
+                assert registry.anchorMsg(bup.said) is True
+                reads.armed = False
+                assert rgy.store.headEvent(registry.regk).said == bup.said
+                return reads.count
+
+            for _ in range(8):
+                issueAndAnchor()
+            early = issueAndAnchor()
+            assert hab.kever.sn == 10
+            for _ in range(39):
+                issueAndAnchor()
+            late = issueAndAnchor()
+            assert hab.kever.sn == 50
+            assert late == early, f"read {early} key events at sn 10 and {late} at sn 50"
+        finally:
+            rgy.close()
