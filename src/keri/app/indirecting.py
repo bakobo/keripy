@@ -1243,6 +1243,11 @@ class QueryEnd:
 
                 pre (string, optional): For 'kel' queries, the specific 'pre' to query.
                 sn (int, optional): For "kel" queries. If provided, returns events with seq-num >= sn.
+                fn (int, optional): For "kel" queries. If provided, returns the events this
+                    witness first saw at first-seen ordinal >= fn, in first-seen order, as
+                    clonePreIter does. A client that already holds a KEL asks with the count of
+                    events it has from this witness and receives only what is new, including a
+                    recovery rotation that supersedes events it holds. Not combinable with sn.
 
                 reg (string, optional): For 'tel' queries, registry pre. Required if vcid not provided.
                 vcid (string, optional): For 'tel' queries, credential said. Required if reg not provided.
@@ -1254,6 +1259,7 @@ class QueryEnd:
                 Example:
                     - /query?typ=kel&pre=ELZ1KBCFOmdj1RPu6kMUnzgMBTl4YsHfpw7wIGvLgW5W
                     - /query?typ=kel&pre=ELZ1KBCFOmdj1RPu6kMUnzgMBTl4YsHfpw7wIGvLgW5W&sn=5
+                    - /query?typ=kel&pre=ELZ1KBCFOmdj1RPu6kMUnzgMBTl4YsHfpw7wIGvLgW5W&fn=12
                     - /query?typ=tel&reg=EHrbPfpRLU9wpFXTzGY-LIo2FjMiljjEnt238eWHb7yZ&vcid=EO5y0jMXS5XKTYBKjCUPmNKPr1FWcWhtKwB2Go2ozvr0"""
 
         typ = req.get_param("typ")
@@ -1270,8 +1276,14 @@ class QueryEnd:
             evnts = bytearray()
 
             sn = req.get_param_as_int("sn")
+            fn = req.get_param_as_int("fn", min_value=0)
+            if sn is not None and fn is not None:
+                raise falcon.HTTPBadRequest(description="'sn' and 'fn' cannot be combined")
             vrsn = self.hab.kevers[pre].serder.pvrsn if pre in self.hab.kevers else Version
-            if sn is not None: ## query for event with seq-num >= sn
+            if fn is not None:  # query for events first seen at ordinal >= fn
+                for msg in self.hab.db.clonePreIter(pre=pre, fn=fn, version=vrsn):
+                    evnts.extend(msg)
+            elif sn is not None: ## query for event with seq-num >= sn
                 dig = self.hab.db.kels.getLast(keys=pre, on=sn)
                 if dig is None:
                     raise falcon.HTTPBadRequest(description=f"non-existant event at seq-num {sn}")
