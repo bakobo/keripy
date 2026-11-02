@@ -489,6 +489,49 @@ def test_query_end_reuses_injected_reger():
     assert qe.reger is mock_reger
 
 
+def test_query_end_kel_from_first_seen_ordinal():
+    """A KEL query with fn serves the first-seen log from that ordinal, so a client that
+    already holds a key history asks only for what the witness first saw since."""
+    from keri.app.indirecting import QueryEnd
+
+    with openHby(name="fen", salt=Salter(raw=b'0123456789abcdef').qb64) as hby:
+        hab = hby.makeHab(name="fen", transferable=True)
+        for _ in range(3):
+            hab.interact()
+
+        app = falcon.App()
+        app.add_route("/query", QueryEnd(hab, reger=None))
+        client = testing.TestClient(app)
+
+        def replay(fn):
+            return b"".join(bytes(msg) for msg in
+                            hab.db.clonePreIter(pre=hab.pre, fn=fn,
+                                                version=hab.kever.serder.pvrsn))
+
+        whole = client.simulate_get("/query", params={"typ": "kel", "pre": hab.pre})
+        for fn in range(5):
+            res = client.simulate_get("/query",
+                                      params={"typ": "kel", "pre": hab.pre, "fn": fn})
+            assert res.status_code == 200
+            assert res.headers['Content-Type'] == "application/cesr"
+            assert res.content == replay(fn)
+        assert client.simulate_get(
+            "/query", params={"typ": "kel", "pre": hab.pre, "fn": 0}).content == whole.content
+        assert client.simulate_get(
+            "/query", params={"typ": "kel", "pre": hab.pre, "fn": 2}).content != whole.content
+        assert client.simulate_get(
+            "/query", params={"typ": "kel", "pre": hab.pre, "fn": 9}).content == b""
+
+        # fn and sn name different starting points, so asking for both is refused
+        res = client.simulate_get("/query",
+                                  params={"typ": "kel", "pre": hab.pre, "fn": 1, "sn": 1})
+        assert res.status_code == 400
+        for bad in ("-1", "x"):
+            res = client.simulate_get("/query",
+                                      params={"typ": "kel", "pre": hab.pre, "fn": bad})
+            assert res.status_code == 400
+
+
 if __name__ == "__main__":
     test_mailbox_iter()
     test_qrymailbox_iter()
