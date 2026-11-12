@@ -492,8 +492,8 @@ class _Answered:
 OTHER = "BAz6CgLwdbIR8rp-Pz5UsPtzUxtzQrnJkrr6DwoF7SLe"
 
 
-def _answer(oobiery, hby, url, response, verified=False):
-    obr = OobiRecord(date="2026-01-01T00:00:00.000000+00:00", cid=AID, role="controller",
+def _answer(oobiery, hby, url, response, verified=False, cid=AID):
+    obr = OobiRecord(date="2026-01-01T00:00:00.000000+00:00", cid=cid, role="controller",
                      oobialias="alice")
     hby.db.coobi.pin(keys=(url,), val=obr)
     oobiery.clients[url] = _Answered(response, verified=verified)
@@ -512,15 +512,19 @@ def oobiery():
 
 def test_an_unverified_oobi_answer_cannot_say_which_aid_an_alias_names(oobiery):
     """Over an unverified connection the KERI-AID header is an interloper's word. The alias stays
-    with the AID the OOBI URL itself names."""
+    with the AID the OOBI URL itself names. That AID's key state is already held, so the
+    answer resolves and the alias is attached."""
     oobiery, hby = oobiery
-    url = f"https://127.0.0.1:5643/oobi/{AID}/controller"
+    named = hby.makeHab(name="named", transferable=False, version=Vrsn_1_0, kind=Kinds.json).pre
+    url = f"https://127.0.0.1:5643/oobi/{named}/controller"
     robr = _answer(oobiery, hby, url, dict(
         status=200, body=b"",
-        headers={"Content-Type": httping.CESR_CONTENT_TYPE, oobiing.OOBI_AID_HEADER: OTHER}))
+        headers={"Content-Type": httping.CESR_CONTENT_TYPE, oobiing.OOBI_AID_HEADER: OTHER}),
+        cid=named)
 
-    assert robr.cid == AID
-    assert oobiery.org.get(AID)["alias"] == "alice"
+    assert robr.state == oobiing.Result.resolved
+    assert robr.cid == named
+    assert oobiery.org.get(named)["alias"] == "alice"
     assert oobiery.org.get(OTHER) is None
 
 
