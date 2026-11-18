@@ -19,6 +19,7 @@ from keri.help import helping
 from keri.vc import credential
 from keri.acdc import acdcagg
 from keri.acdc.messaging import acgSchemaDefault
+from keri.acdc.relating import delegationRefusal
 from keri.vdr import Verifier, Regery, Tevery
 
 
@@ -1766,6 +1767,8 @@ def test_verifier_di2i_requires_anchored_delegation(seeder):
         # processCredential's callers handle.
         assert qvi.pre not in witHby.kevers
         assert witverfer._isDelegatedAID(sub.pre, qvi.pre) is False
+        # Pending, not refused: the shared climb tells the two apart (keri.acdc.relating).
+        assert delegationRefusal(witHby.kevers, witHby.db, sub.pre, qvi.pre) is None
 
         # Give the witness everything except qvi's approval: qvi's KEL up to but not
         # including it, qvi's registry TEL, and the far node's TEL.
