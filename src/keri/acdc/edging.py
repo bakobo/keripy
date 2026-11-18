@@ -26,8 +26,12 @@ rule, so the two v2 evaluators agree. Three differences are deliberate:
   the specification's text (spec-body.md, "The NOT unary Operator ... inverts the
   validation truthiness of the node pointed to by this Edge"). Withholding cannot
   satisfy it, because the negation of unknown is unknown.
-- DI2I is evaluated when the caller supplies a delegator resolver, and is an unknown
-  no arrival settles when it does not.
+- DI2I is evaluated when the caller supplies a delegation check, and is an unknown
+  no arrival settles when it does not. The check is meant to be
+  keri.acdc.relating.delegationRefusal over the verifier's own key state, the climb
+  the v1 Verifier and upstream's v2 IPEX path share, so that every evaluator reads a
+  delegation from the delegator's anchoring seal and not from the delegate's own
+  claim in its `dip`.
 
 Malformed shapes raise EdgeShapeError rather than entering the lattice, because a
 shape is not a truth value and a satisfied sibling under OR must not outvote it.
@@ -59,16 +63,20 @@ ACDC defines a registry's transaction states per registry."""
 TerminalStates = ("revoked",)
 """Registry states registryStanding reads as refusing the far node."""
 
-DelegationDepth = 32
-"""How many delegators DI2I will climb from the near issuer before giving up. A
-bound rather than a belief: the resolver is the caller's, and nothing here can
-promise it terminates."""
-
 FarNodeAbsent = namedtuple("FarNodeAbsent", "said")
 """The cause attached to an edge whose far node was not presented.
 
 Fields:
     said (str): the far node's SAID, as the Edge names it
+"""
+
+
+DelegationPending = namedtuple("DelegationPending", "pre delpre")
+"""The cause attached to a DI2I edge whose delegation check could not yet decide.
+
+Fields:
+    pre (str): the near issuer, whose delegation is in question
+    delpre (str): the far issuee it must be delegated from
 """
 
 
@@ -80,7 +88,7 @@ class EdgeShapeError(ValidationError):
     """
 
 
-def verifyEdges(acdc, *, nodes, standing, schemas=None, delegators=None,
+def verifyEdges(acdc, *, nodes, standing, schemas=None, delegation=None,
                 reducers=None):
     """Returns the verdict of acdc's Edge Section over the far nodes presented.
 
@@ -102,9 +110,14 @@ def verifyEdges(acdc, *, nodes, standing, schemas=None, delegators=None,
         schemas (callable|None): schemas(said) -> Schemer|None resolving an edge
             schema pin named by SAID. None resolves nothing, which leaves every pin
             named by SAID an unknown, retryable verdict.
-        delegators (callable|None): delegators(aid) -> str|None naming the AID that
-            delegated aid, or None when it is not delegated or not known. Needed only
-            by DI2I; without it DI2I is an unknown no arrival settles.
+        delegation (callable|None): delegation(pre, delpre) -> str|None answering
+            whether pre is a delegated AID of delpre at any depth, with the contract of
+            keri.acdc.relating.delegationRefusal: "" when it is, a non-empty reason when
+            it is decided not to be, and None when evidence it needs (a KEL, an
+            anchoring seal) is not in hand yet. Pass
+            ``lambda pre, delpre: relating.delegationRefusal(hby.kevers, hby.db, pre,
+            delpre)``. Needed only by DI2I, and never consulted when the near issuer is
+            the far issuee; without it DI2I is an unknown no arrival settles.
         reducers (dict|None): m-ary Operator table, default chaining.MAryReducers
 
     Returns:
@@ -118,7 +131,7 @@ def verifyEdges(acdc, *, nodes, standing, schemas=None, delegators=None,
             raise EdgeShapeError(f"far node keyed {said} is {serder.said}")
 
     walker = _Walker(nodes=nodes, standing=standing, schemas=schemas,
-                     delegators=delegators,
+                     delegation=delegation,
                      reducers=chaining.MAryReducers if reducers is None else reducers)
     return walker.section(acdc)
 
@@ -264,11 +277,11 @@ def _named(section):
 class _Walker:
     """One evaluation of one near ACDC's Edge Section, memoised by far node."""
 
-    def __init__(self, *, nodes, standing, schemas, delegators, reducers):
+    def __init__(self, *, nodes, standing, schemas, delegation, reducers):
         self.nodes = nodes
         self.standing = standing
         self.schemas = schemas
-        self.delegators = delegators
+        self.delegation = delegation
         self.reducers = reducers
         self.memo = {}
 
@@ -407,26 +420,24 @@ class _Walker:
             return chaining.invalid(f"I2I edge to node {said} requires the near "
                                     f"issuer to be the far issuee; issuer "
                                     f"{near.israid} != far issuee {far.iseaid}")
-        if dop == "DI2I":
-            if self.delegators is None:
-                return chaining.unknown(f"DI2I edge to node {said} needs a delegator "
-                                        f"resolver, and none was given",
+        if dop == "DI2I" and near.israid != far.iseaid:
+            if self.delegation is None:
+                return chaining.unknown(f"DI2I edge to node {said} needs a delegation "
+                                        f"check, and none was given",
                                         retryable=False)
-            if not self.delegated(near.israid, far.iseaid):
+            refusal = self.delegation(near.israid, far.iseaid)
+            if refusal is None:
+                return chaining.unknown(f"DI2I edge to node {said} waits on key state "
+                                        f"or an anchoring seal the delegation from "
+                                        f"{far.iseaid} to the near issuer "
+                                        f"{near.israid} needs", retryable=True,
+                                        cause=DelegationPending(near.israid,
+                                                                far.iseaid))
+            if refusal:
                 return chaining.invalid(f"DI2I edge to node {said} requires the near "
                                         f"issuer {near.israid} to be the far issuee "
-                                        f"{far.iseaid} or delegated from it")
+                                        f"{far.iseaid} or delegated from it; {refusal}")
         return chaining.valid(f"edge to node {said} satisfies its Operators")
-
-    def delegated(self, issuer, issuee):
-        """True when issuer is issuee or sits below it in a delegation chain."""
-        aid, seen = issuer, set()
-        while aid is not None and aid not in seen and len(seen) <= DelegationDepth:
-            if aid == issuee:
-                return True
-            seen.add(aid)
-            aid = self.delegators(aid)
-        return False
 
     def pinned(self, resolved, *, far):
         """Returns a non-valid verdict when a schema pin fails, else None."""
