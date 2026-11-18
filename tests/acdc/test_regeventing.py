@@ -34,6 +34,7 @@ from keri.core.signing import Salter
 from keri.acdc import Registry, Regery, regcept, blindate, acdcmap
 from keri.acdc import regeventing
 from keri.acdc.regeventing import RegStateRecord, vet, vetBlind
+from keri.acdc.merkling import BatchTree, BATCH_TREE_TYPE
 from keri.app import habbing
 
 
@@ -409,23 +410,170 @@ def test_V11_multiple_seals_tolerated():
         assert rec.said == ripper.said
 
 
-def test_V12_smt_root_anchor_refused_by_name():
-    """V12: a registry whose claimed anchor is an SMT root -- a seal digest
-    matching no TEL event SAID -- is refused by its own name, not as a
-    generic "unanchored"."""
+def herd(n=5):
+    """TEL event SAIDs from other registries and issuees that share a batch
+    with the events under test: the batch is the anonymity set."""
+    return [Diger(ser=b'herd event %d' % i).qb64 for i in range(n)]
+
+
+def anchorBatch(hab, *serders, typed=False, extra=()):
+    """Anchor the given TEL events under ONE batch root seal in hab's KEL,
+    mixed with herd leaves.  Returns (tree, proofs) where proofs maps each
+    TEL event SAID to its inclusion proof."""
+    leaves = sorted([serder.said for serder in serders] + herd() + list(extra))
+    tree = BatchTree(leaves)
+    seal = (dict(t=BATCH_TREE_TYPE, d=tree.root) if typed
+            else dict(rd=tree.root))
+    anchor(hab, data=[seal])
+    return tree, {serder.said: tree.prove(serder.said) for serder in serders}
+
+
+def test_V12_root_anchor_without_proof_refused_by_name():
+    """V12: a registry whose claimed anchor is a batch root -- a seal matching
+    no TEL event SAID -- and for which no inclusion proof is presented is
+    refused by its own name, not as a generic "unanchored"."""
     with openIssuer("v12") as (hby, hab):
         ripper = makeRegistry(hab, anchored=False)
         root = Diger(ser=ripper.saidb + b'sibling tel event saids').qb64
         anchor(hab, data=[dict(d=root)])  # Merkle-root style bulk seal
         claim = hab.kever.sn  # the caller claims this KEL event anchors it
 
-        with pytest.raises(kering.RootSealError):
+        with pytest.raises(kering.RootSealError) as ex:
             vet(rip=ripper, db=hby.db, sources={ripper.said: claim})
+        assert 'inclusion proof' in str(ex.value)
 
         # without the claim there is nothing to refuse: the seal is simply
         # not found, which establishes nothing, retryably
         with pytest.raises(kering.MissingAnchorError):
             vet(rip=ripper, db=hby.db)
+
+
+def test_V12a_batch_root_anchor_with_proofs_verifies():
+    """V12a: rip and bup committed under ONE Merkle-root seal {rd} in the
+    issuer's KEL, among herd leaves: with an inclusion proof per event the
+    chain verifies, and each anchor couple names the root-sealing event."""
+    with openIssuer("v12a") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        acdc = makeAcdc(hab, regid=ripper.said)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
+        tree, proofs = anchorBatch(hab, ripper, bup)
+        rootEvent = hab.kever.serder
+
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, acdc=acdc,
+                  blinder=blinder, proofs=proofs)
+        assert rec.state == 'issued'
+        assert rec.binding == 'mutual'
+        assert rec.anchors == ((rootEvent.sn, rootEvent.said),) * 2
+
+        # a source claim naming the root event is honoured, by sn or said
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, proofs=proofs,
+                  sources={ripper.said: rootEvent.sn, bup.said: rootEvent.said})
+        assert rec.anchors == ((rootEvent.sn, rootEvent.said),) * 2
+
+        # without the proofs the root seals nothing a verifier can check
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, updates=[bup], db=hby.db)
+        with pytest.raises(kering.RootSealError):
+            vet(rip=ripper, updates=[bup], db=hby.db,
+                sources={ripper.said: rootEvent.sn})
+
+
+def test_V12b_mixed_direct_and_root_anchors():
+    """V12b: a rip anchored by its own seal couple and a bup anchored under
+    a batch root verify together; a proof for an event that also has a
+    direct seal does no harm."""
+    with openIssuer("v12b") as (hby, hab):
+        ripper = makeRegistry(hab)
+        direct = hab.kever.serder
+        acdc = makeAcdc(hab, regid=ripper.said)
+        blinder, bup = makeUpdate(ripper.said, ripper.said, acdc.said,
+                                  'issued', sn=1, stamp=STAMP1)
+        _, proofs = anchorBatch(hab, bup)
+        rootEvent = hab.kever.serder
+
+        rec = vet(rip=ripper, updates=[bup], db=hby.db, proofs=proofs)
+        assert rec.anchors == ((direct.sn, direct.said),
+                               (rootEvent.sn, rootEvent.said))
+
+        # an ACDC presented with a verified registry still binds through
+        # vetRegistries and vetBinds, which pass the proofs through
+        recs = regeventing.vetRegistries(acdc, [(ripper, [bup], blinder)],
+                                         db=hby.db, proofs=proofs)
+        assert [r.state for r in recs] == ['issued']
+        rec = regeventing.vetBinds(ripper, [bup], db=hby.db,
+                                   blinders=[blinder], target=acdc.said,
+                                   acdc=acdc, proofs=proofs)
+        assert rec.state == 'issued'
+
+
+def test_V12c_typed_batch_seal_verifies():
+    """V12c: the typed seal {t, d} whose type is the ACDC v2.0 batch tree is
+    a root seal too; a typed seal of any other type is not."""
+    with openIssuer("v12c") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        _, proofs = anchorBatch(hab, ripper, typed=True)
+        rootEvent = hab.kever.serder
+        rec = vet(rip=ripper, db=hby.db, proofs=proofs)
+        assert rec.anchors == ((rootEvent.sn, rootEvent.said),)
+
+    with openIssuer("v12c2") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        tree = BatchTree(sorted([ripper.said] + herd()))
+        anchor(hab, data=[dict(t='Xother-tree-type', d=tree.root)])
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, db=hby.db,
+                proofs={ripper.said: tree.prove(ripper.said)})
+
+
+def test_V12d_bare_digest_of_root_is_not_a_root_seal():
+    """V12d: a bare digest seal {d: root} commits to one datum and is not
+    read as a tree root: the proof finds no root seal, retryably."""
+    with openIssuer("v12d") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        tree = BatchTree(sorted([ripper.said] + herd()))
+        anchor(hab, data=[dict(d=tree.root)])
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, db=hby.db,
+                proofs={ripper.said: tree.prove(ripper.said)})
+
+
+def test_V12e_root_in_strangers_kel_refused():
+    """V12e: the batch root is sealed only in a KEL whose controller is not
+    the registry issuer: refused -- an endorsement is not a commitment."""
+    with habbing.openHby(name="v12e", temp=True, version=Vrsn_2_0) as hby:
+        issuer = hby.makeHab(name="issuer", version=Vrsn_2_0)
+        stranger = hby.makeHab(name="stranger", version=Vrsn_2_0)
+        ripper = regcept(israid=issuer.pre, stamp=STAMP0)
+        _, proofs = anchorBatch(stranger, ripper)
+        with pytest.raises(kering.MisanchorError) as ex:
+            vet(rip=ripper, db=hby.db, proofs=proofs)
+        assert issuer.pre in str(ex.value)
+        assert stranger.pre in str(ex.value)
+
+
+def test_V12f_wrong_or_malformed_proof():
+    """V12f: a well-formed proof that reconstructs a root the issuer never
+    sealed establishes nothing, retryably (the root's event may not be
+    gathered yet).  A malformed proof is a permanent, named refusal."""
+    with openIssuer("v12f") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        tree, proofs = anchorBatch(hab, ripper)
+        proof = proofs[ripper.said]
+
+        # a proof for a different leaf of the same tree
+        other = herd()[0]
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, db=hby.db, proofs={ripper.said: tree.prove(other)})
+        # a truncated proof
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, db=hby.db, proofs={ripper.said: proof[1:]})
+        # malformed
+        with pytest.raises(kering.MerkleProofError):
+            vet(rip=ripper, db=hby.db,
+                proofs={ripper.said: [(proof[0][0], 'up')]})
+        # the genuine proof still verifies
+        assert vet(rip=ripper, db=hby.db, proofs=proofs).said == ripper.said
 
 
 def test_V13_seal_reference_without_seal_retryable():

@@ -116,6 +116,7 @@ from keri.core import Salter, Noncer, Aggor, Mapper, Diger, Verfer, exchange
 from keri.core.coring import MtrDex, NonceDex, Verser
 from keri.core.eventing import incept
 from keri.kering import Vrsn_2_0
+from keri.acdc.merkling import BatchTree, BATCH_TREE_TYPE
 from keri.acdc import regcept, blindate, acdcmap, acdcagg
 from keri.core.structing import Blinder, BlindState, Sealer, SealKind, SealRoot
 
@@ -261,81 +262,12 @@ class _BulkNonces:
 # the bare one is that an untyped anchor can be REFUSED rather than read as a dense-tree
 # root. The co-created sibling still uses the bare SealRoot, so the two spellings sit side
 # by side.
-BATCH_TREE_TYPE = Verser(proto=Protocols.acdc, pvrsn=Vrsn_2_0, gvrsn=Vrsn_2_0).qb64
+# keri.acdc.merkling.BATCH_TREE_TYPE: Verser(proto=ACDC, pvrsn=2.0, gvrsn=2.0).
 
 
-class _BatchTree:
-    """Merkle tree over TEL transaction-event SAIDs, anchored by ONE typed seal.
-
-    The Issuer periodically anchors a single seal in its KEL whose digest is this tree's
-    root, committing every transaction event from every registry touched since the last
-    anchor -- across all bulk-issued sets, all Issuees, and (here) all the unassigned
-    registries the round padded itself with (spec L2920-2926, #204). A Validator that
-    receives one event plus its inclusion proof learns that the Issuer committed to that
-    event and learns nothing about any other leaf.
-
-    Construction pinned by #204: a leaf is H(0x00 + leafSAID), an interior node is
-    H(0x01 + left + right), over qb64 TEXT concatenation with Blake3-256; RFC 6962 domain
-    separation is what stops an interior node's preimage from being replayed as a leaf.
-    An odd node at any level is PROMOTED unchanged rather than duplicated, which avoids
-    the duplicate-last-leaf ambiguity (CVE-2012-2459).
-
-    This is a plain (dense) Merkle tree. Spec L2918 also describes an amalgamated sparse
-    tree over every event of every registry; #204 records that the two are different
-    structures and that a bare root digest cannot distinguish them, which is the reason
-    for the typed seal above.
-    """
-
-    Leaf = b'\x00'      # RFC 6962 leaf domain prefix
-    Node = b'\x01'      # RFC 6962 interior-node domain prefix
-
-    def __init__(self, leaves):
-        if not leaves:
-            raise ValueError("a batch must commit at least one transaction event")
-        self.leaves = list(leaves)
-        self.levels = [[self._leaf(leaf) for leaf in self.leaves]]
-        while len(self.levels[-1]) > 1:
-            cur = self.levels[-1]
-            nxt = [self._node(cur[i], cur[i + 1]) for i in range(0, len(cur) - 1, 2)]
-            if len(cur) % 2:            # promote the odd node, never duplicate it
-                nxt.append(cur[-1])
-            self.levels.append(nxt)
-
-    @classmethod
-    def _leaf(cls, said):
-        return Diger(ser=cls.Leaf + said.encode()).qb64
-
-    @classmethod
-    def _node(cls, left, right):
-        return Diger(ser=cls.Node + (left + right).encode()).qb64
-
-    @property
-    def root(self):
-        """The batch root: the single value the Issuer seals in its KEL."""
-        return self.levels[-1][0]
-
-    def prove(self, said):
-        """Return the inclusion proof for event `said`: an ordered list of
-        (siblingDigest, side) pairs, leaf level first. `side` is which side the sibling
-        sits on. A promoted odd node contributes no sibling at that level."""
-        index = self.leaves.index(said)
-        proof = []
-        for level in self.levels[:-1]:
-            if index % 2:
-                proof.append((level[index - 1], 'L'))
-            elif index + 1 < len(level):
-                proof.append((level[index + 1], 'R'))
-            index //= 2
-        return proof
-
-    @classmethod
-    def verify(cls, said, proof, root):
-        """Recompute the root from the event SAID and its proof; True iff it matches."""
-        digest = cls._leaf(said)
-        for sibling, side in proof:
-            digest = (cls._node(sibling, digest) if side == 'L'
-                      else cls._node(digest, sibling))
-        return digest == root
+# The batch tree moved into the library, keri.acdc.merkling, unchanged; the
+# pinned roots below now pin the library construction.
+_BatchTree = BatchTree
 
 
 def _batch(*eventSaidGroups):
