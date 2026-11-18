@@ -130,3 +130,21 @@ def test_worked_examples_use_the_library_tree():
     assert pre._BatchTree is BatchTree
     assert pre.BATCH_TREE_TYPE == BATCH_TREE_TYPE
     assert merkling.BatchTree is BatchTree
+
+
+def test_tree_hash_is_the_codes_digest():
+    """The tree hashes with the digest algorithm its code names; Blake3-256
+    by default.  A proof folds with the code it is asked for, so a proof from
+    a SHA3 tree reconstructs that tree's root only under the SHA3 code."""
+    from keri.core.coring import DigDex
+    leaves = saids(5)
+    sha = BatchTree(leaves, code=DigDex.SHA3_256)
+    a = leaves[0]
+    assert sha.leaf(a, code=DigDex.SHA3_256) == Diger(
+        ser=b'\x00' + a.encode(), code=DigDex.SHA3_256).qb64
+    assert Diger(qb64=sha.root).code == DigDex.SHA3_256
+    proof = sha.prove(leaves[3])
+    assert rootOf(leaves[3], proof, code=DigDex.SHA3_256) == sha.root
+    assert rootOf(leaves[3], proof) != sha.root
+    assert BatchTree.verify(leaves[3], proof, sha.root)  # code read off root
+    assert Diger(qb64=BatchTree(leaves).root).code == DigDex.Blake3_256

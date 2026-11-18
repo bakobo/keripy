@@ -30,6 +30,7 @@ import pytest
 from keri import kering
 from keri import Vrsn_2_0, Ilks
 from keri.core import Blinder, BlindState, Diger, Number, SerderACDC
+from keri.core.coring import DigDex
 from keri.core.signing import Salter
 from keri.acdc import Registry, Regery, regcept, blindate, acdcmap
 from keri.acdc import regeventing
@@ -574,6 +575,43 @@ def test_V12f_wrong_or_malformed_proof():
                 proofs={ripper.said: [(proof[0][0], 'up')]})
         # the genuine proof still verifies
         assert vet(rip=ripper, db=hby.db, proofs=proofs).said == ripper.said
+
+
+def test_V12g_wrong_hint_at_root_event_does_not_refuse_direct_anchor():
+    """V12g: a TEL event sealed directly at one key event, with a source
+    hint naming a different key event that holds only a batch root seal and
+    no proof presented: the hint is just a bad hint, the scan finds the
+    direct seal, and the event verifies (panel SEC-F4)."""
+    with openIssuer("v12g") as (hby, hab):
+        ripper = makeRegistry(hab)
+        direct = hab.kever.serder
+        tree = BatchTree(sorted(herd()))
+        anchor(hab, data=[dict(rd=tree.root)])
+        rootEvent = hab.kever.serder
+        rec = vet(rip=ripper, db=hby.db, sources={ripper.said: rootEvent.sn})
+        assert rec.anchors == ((direct.sn, direct.said),)
+
+
+def test_V12h_tree_hash_follows_root_digest_code():
+    """V12h: the root's derivation code names the tree's hash: a batch tree
+    built with SHA3-256 and sealed under its SHA3 root verifies, and a
+    Blake3 tree over the same leaves does not prove under it (panel
+    SPC-F3)."""
+    with openIssuer("v12h") as (hby, hab):
+        ripper = makeRegistry(hab, anchored=False)
+        leaves = sorted([ripper.said] + herd())
+        tree = BatchTree(leaves, code=DigDex.SHA3_256)
+        assert Diger(qb64=tree.root).code == DigDex.SHA3_256
+        anchor(hab, data=[dict(rd=tree.root)])
+        rootEvent = hab.kever.serder
+        rec = vet(rip=ripper, db=hby.db,
+                  proofs={ripper.said: tree.prove(ripper.said)})
+        assert rec.anchors == ((rootEvent.sn, rootEvent.said),)
+
+        blake = BatchTree(leaves)
+        with pytest.raises(kering.MissingAnchorError):
+            vet(rip=ripper, db=hby.db,
+                proofs={ripper.said: blake.prove(ripper.said)})
 
 
 def test_V13_seal_reference_without_seal_retryable():

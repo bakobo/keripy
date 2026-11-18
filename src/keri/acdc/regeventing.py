@@ -47,7 +47,7 @@ from ..kering import (Ilks, ValidationError, ConfigurationError,
 from ..core import (Blinder, BlindState, BoundState, Diger, Number, Saider,
                     SerderACDC)
 from . import messaging
-from .merkling import rootOf, rootSeals
+from .merkling import BatchTree, rootOf, rootSeals
 
 logger = help.ogler.getLogger()
 
@@ -292,14 +292,13 @@ def sealDigests(serder):
     return digs
 
 
-def _scanKel(db, pre, said, *, extract=sealDigests):
+def _scanKel(db, pre, said, *, match=None):
     """Scan the KEL of pre in db for a key event whose seals include a digest
     equal to said.
 
     Parameters:
-        extract (Callable): maps a key event serder to the digests its seals
-            commit to; sealDigests for direct seals, _rootDigests for batch
-            tree roots
+        match (Callable|None): predicate on a key event serder replacing the
+            direct-seal test, e.g. "seals a batch root the proof rebuilds"
 
     Returns:
         couple (tuple|None): (sn, said) of the anchoring key event, or None
@@ -315,7 +314,8 @@ def _scanKel(db, pre, said, *, extract=sealDigests):
         eserder = db.evts.get(keys=(pre, dig))
         if eserder is None:
             continue
-        if said in extract(eserder):
+        if (match(eserder) if match is not None
+                else said in sealDigests(eserder)):
             return (sn, eserder.said)
     return None
 
@@ -324,6 +324,15 @@ def _rootDigests(serder):
     """The batch tree roots a key event's seals commit to (see
     merkling.rootSeals)."""
     return rootSeals(serder.sad.get('a'))
+
+
+def _provesUnder(said, proof):
+    """Predicate on a key event serder: some batch root it seals is the root
+    proof rebuilds from said, hashing with that root's own digest code."""
+    def match(eserder):
+        return any(BatchTree.verify(said, proof, root)
+                   for root in _rootDigests(eserder))
+    return match
 
 
 def _verifyAnchorCouple(serder, *, db, issuer, number, diger):
@@ -429,7 +438,12 @@ def vetAnchor(serder, *, db, issuer, source=None, told=(), proof=None):
         MissingAnchorError: no seal found anywhere; the anchor may still be
             in flight (retryable)
     """
-    root = rootOf(serder.said, proof) if proof is not None else None
+    if proof is not None:
+        rootOf(serder.said, proof)  # refuse a malformed proof by name, first
+        proves = _provesUnder(serder.said, proof)
+    else:
+        proves = None
+    rootClaim = None
 
     if _kever(db, issuer) is None:
         raise MissingAnchorError(f"Issuer KEL for {issuer} not available to "
@@ -443,35 +457,37 @@ def vetAnchor(serder, *, db, issuer, source=None, told=(), proof=None):
             roots = _rootDigests(eserder)
             if serder.said in digs:
                 return (eserder.sn, eserder.said)
-            if root is not None and root in roots:
+            if proves is not None and proves(eserder):
                 return (eserder.sn, eserder.said)
-            if (root is None and (digs or roots)
+            if (proves is None and (digs or roots)
                     and not set(digs) & set(told)):
-                raise RootSealError(f"Claimed anchoring key event "
-                                    f"{eserder.said} at sn={eserder.sn} of "
-                                    f"issuer {issuer} seals digest(s) "
-                                    f"matching no event of the presented "
-                                    f"registry {list(told)[:1]}: an "
-                                    f"aggregate (Merkle root) seal, and no "
-                                    f"inclusion proof was presented for "
-                                    f"registry event {serder.said}.")
+                rootClaim = eserder  # refused below unless a direct seal
         # a claim that did not pan out is just a bad hint: fall through
 
     couple = _scanKel(db, issuer, serder.said)
     if couple is not None:
         return couple
 
-    if root is not None:
-        couple = _scanKel(db, issuer, root, extract=_rootDigests)
+    if proves is not None:
+        couple = _scanKel(db, issuer, None, match=proves)
         if couple is not None:
             return couple
+
+    if rootClaim is not None:
+        raise RootSealError(f"Claimed anchoring key event "
+                            f"{rootClaim.said} at sn={rootClaim.sn} of "
+                            f"issuer {issuer} seals digest(s) matching no "
+                            f"event of the presented registry "
+                            f"{list(told)[:1]}: an aggregate (Merkle root) "
+                            f"seal, and no inclusion proof was presented "
+                            f"for registry event {serder.said}.")
 
     for pre in list(db.kevers):
         if pre == issuer:
             continue
         if (_scanKel(db, pre, serder.said) is not None
-                or (root is not None and _scanKel(
-                    db, pre, root, extract=_rootDigests) is not None)):
+                or (proves is not None and _scanKel(
+                    db, pre, None, match=proves) is not None)):
             raise MisanchorError(f"Seal for registry event {serder.said} "
                                  f"found in the KEL of {pre}, which is not "
                                  f"the registry issuer {issuer}: an "
