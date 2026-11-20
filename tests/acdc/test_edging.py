@@ -327,28 +327,99 @@ def test_not_leaves_the_relation_and_the_pins_in_force():
                   standing=revoked).verdict == Verdicts.valid
 
 
+def climb(chain, refusals=()):
+    """A delegation(issuer, issuee) callable over a toy chain, answering as
+    keri.acdc.relating.delegationRefusal does: "" decided for, a reason decided
+    against, None not yet decidable. An AID in refusals is a hop its delegator
+    never anchored and so is pending, as relating reads a missing seal."""
+    def delegation(pre, delpre):
+        seen = set()
+        while pre not in seen:
+            seen.add(pre)
+            if pre in refusals:
+                return None
+            if pre not in chain:
+                return f"{pre} is not delegated, and the chain ends there"
+            if chain[pre] == delpre:
+                return ""
+            pre = chain[pre]
+        return f"delegation chain from {pre} cycles"
+    return delegation
+
+
 def test_di2i_accepts_the_issuee_itself_or_any_delegate_of_it():
     far = acdc(UTAH, issuee=SUE)
-    chain = {PAT: SUE, EVE: PAT}  # PAT is SUE's delegate, EVE is PAT's
-    delegators = chain.get
+    delegation = climb({PAT: SUE, EVE: PAT})  # PAT is SUE's delegate, EVE is PAT's
     for issuer in (SUE, PAT, EVE):
         near = acdc(issuer, edge=edge(far, op="DI2I"))
-        assert verify(near, far, delegators=delegators).verdict == Verdicts.valid
+        assert verify(near, far, delegation=delegation).verdict == Verdicts.valid
     near = acdc(GUY, edge=edge(far, op="DI2I"))
-    assert verify(near, far, delegators=delegators).verdict == Verdicts.invalid
+    verdict = verify(near, far, delegation=delegation)
+    assert verdict.verdict == Verdicts.invalid
+    assert "chain ends there" in verdict.reason
+
+
+def test_di2i_asks_nothing_when_the_issuer_is_the_issuee():
+    far = acdc(UTAH, issuee=SUE)
+    def never(pre, delpre):
+        raise AssertionError("I2I's arm of DI2I needs no KEL")
+    near = acdc(SUE, edge=edge(far, op="DI2I"))
+    assert verify(near, far, delegation=never).verdict == Verdicts.valid
+
+
+def test_di2i_waits_on_a_delegation_not_yet_anchored():
+    """A seal the climb needs and has not seen may yet arrive, so the verdict is a
+    retryable unknown rather than a refusal (relating.delegationRefusal's None)."""
+    far = acdc(UTAH, issuee=SUE)
+    near = acdc(PAT, edge=edge(far, op="DI2I"))
+    verdict = verify(near, far, delegation=climb({PAT: SUE}, refusals={PAT}))
+    assert verdict.verdict == Verdicts.unknown
+    assert verdict.retryable
+    assert edging.DelegationPending(PAT, SUE) in verdict.causes
+
+
+def test_di2i_reads_only_the_empty_string_as_delegated():
+    """A check that answers with a bool rather than relating's strings must not
+    open the edge: False is falsy, like "", and was once read as delegated."""
+    far = acdc(UTAH, issuee=SUE)
+    near = acdc(GUY, edge=edge(far, op="DI2I"))
+    for answer in (False, 0, b"", True):
+        verdict = verify(near, far, delegation=lambda pre, delpre: answer)
+        assert verdict.verdict == Verdicts.invalid, answer
 
 
 def test_di2i_refuses_an_untargeted_far_node():
     far = acdc(UTAH)
     near = acdc(SUE, edge=edge(far, op="DI2I"))
-    assert verify(near, far, delegators={}.get).verdict == Verdicts.invalid
+    assert verify(near, far, delegation=climb({})).verdict == Verdicts.invalid
 
 
-def test_di2i_survives_a_delegation_cycle_in_the_resolver():
-    far = acdc(UTAH, issuee=SUE)
-    near = acdc(PAT, edge=edge(far, op="DI2I"))
-    looped = {PAT: EVE, EVE: PAT}.get
-    assert verify(near, far, delegators=looped).verdict == Verdicts.invalid
+def test_di2i_reads_the_delegators_anchor_not_the_delegates_claim():
+    """Through relating over real KELs: a dip names its delegator, but only the
+    delegator's anchoring seal makes it a delegation. Both delegates live in the
+    verifying Habery, where keripy accepts a locally owned dip unanchored."""
+    from keri.acdc.relating import delegationRefusal
+    from keri.app.habbing import openHby
+    from tests.vdr.test_verifying import anchorApproval
+
+    with openHby(name="edgedi2i", temp=True) as hby:
+        boss = hby.makeHab(name="boss")
+        staff = hby.makeHab(name="staff", delpre=boss.pre)
+        anchorApproval(boss, staff)
+        claimant = hby.makeHab(name="claimant", delpre=boss.pre)
+        assert hby.kevers[claimant.pre].delpre == boss.pre  # what it claims
+
+        def delegation(pre, delpre):
+            return delegationRefusal(hby.kevers, hby.db, pre, delpre)
+
+        far = acdc(UTAH, issuee=boss.pre)
+        approved = verify(acdc(staff.pre, edge=edge(far, op="DI2I")), far,
+                          delegation=delegation)
+        assert approved.verdict == Verdicts.valid
+        claimed = verify(acdc(claimant.pre, edge=edge(far, op="DI2I")), far,
+                         delegation=delegation)
+        assert claimed.verdict == Verdicts.unknown
+        assert claimed.retryable
 
 
 def test_di2i_without_a_resolver_is_undecided_for_good():
@@ -492,16 +563,15 @@ def test_a_far_node_named_twice_is_judged_once():
     assert standing.asked == [far.said]
 
 
-def test_di2i_gives_up_past_the_delegation_depth():
+def test_di2i_sets_no_depth_bound_of_its_own():
+    """Depth is the delegator's to bound, with DND; a bound here would let two
+    conforming verifiers disagree on identical bytes (relating's docstring)."""
     far = acdc(UTAH, issuee=SUE)
-    depth = edging.DelegationDepth
-    chain = {f"aid{k}": f"aid{k + 1}" for k in range(depth + 2)}
-    chain[f"aid{depth + 2}"] = SUE
-    near = acdc(PAT, edge=edge(far, op="DI2I"))
+    chain = {f"aid{k}": f"aid{k + 1}" for k in range(99)}
+    chain["aid99"] = SUE
     chain[PAT] = "aid0"
-    assert verify(near, far, delegators=chain.get).verdict == Verdicts.invalid
-    shallow = {PAT: "aid0", "aid0": SUE}
-    assert verify(near, far, delegators=shallow.get).verdict == Verdicts.valid
+    near = acdc(PAT, edge=edge(far, op="DI2I"))
+    assert verify(near, far, delegation=climb(chain)).verdict == Verdicts.valid
 
 
 # ---------------------------------------------------------------------------

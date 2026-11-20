@@ -17,6 +17,7 @@ from ..kering import (Ilks, MissingChainError,
                       MissingChainError, RevokedChainError)
 from ..core import Dater, Saider, Parser, CacheResolver, Schemer
 from ..help import helping
+from ..acdc import relating
 
 from .eventing import Tevery, Reger, query
 
@@ -35,8 +36,8 @@ class Verifier:
 
     # Unary edge operators this verifier recognizes. A token outside this set is not an
     # operator to this verifier and is skipped when resolving a list-valued `o` (see
-    # .verifyChain). DI2I and NOT are recognized but unimplemented: they are listed so
-    # they fail closed diagnosably instead of being dropped and silently defaulting.
+    # .verifyChain). NOT is recognized but unimplemented (#1554): it is listed so it fails
+    # closed diagnosably instead of being dropped and silently defaulting.
     # E1E is normative on the spec's v1.1 branch (kswg-acdc-specification#197). It is
     # absent from the 1.0 text currently under ToIP ratification, so a validator built
     # against 1.0 alone will not recognize it.
@@ -408,13 +409,17 @@ class Verifier:
                 case the latest recognized one takes precedence. None, an empty list,
                 or a value containing no recognized operator applies the default:
                 I2I for a targeted far node, NI2I for an untargeted one.
-            issuer (str) qb64 AID of the issuer of the near (edge-bearing) ACDC
+            issuer (str) qb64 AID of the issuer of the near (edge-bearing) ACDC. The
+                delegative operators (I2I, DI2I) constrain this against the far node's
+                issuee.
             issuee (str|None): qb64 AID of the issuee of the near (edge-bearing) ACDC,
                 required by the identity operators (E1E). None when the near ACDC is
                 untargeted.
 
         Returns:
-            Serder: transaction event state notification message
+            Serder|None: transaction event state notification message for the far node,
+                or None if the edge does not verify. None is a validation outcome, not an
+                error: processCredential turns it into a missing-chain escrow and retry.
 
         """
         said = self.reger.saved.get(keys=nodeSaid)
@@ -450,10 +455,6 @@ class Verifier:
             raise ValidationError(f"Unsupported edge operator NOT on edge to node "
                                   f"{nodeSaid}; NOT validation is not implemented")
 
-        if op == 'DI2I':
-            raise ValidationError(f"Unsupported edge operator DI2I on edge to node "
-                                  f"{nodeSaid}; DI2I validation is not implemented")
-
         if 'E1E' in ops:
             # Identity relation (discussion #1515): the issuee AID of the near ACDC
             # (the one carrying this edge) MUST equal the issuee AID of the far node.
@@ -465,11 +466,37 @@ class Verifier:
             if farIssuee is None or issuee is None or issuee != farIssuee:
                 return None
 
-        if op is not None and op != 'NI2I':
+        if op == 'DI2I':
+            # Delegated-issuer relation (ACDC spec-body.md L1194): the near ACDC's issuer
+            # MUST be "either the Issuee AID or a delegated AID" of the far node's issuee.
+            # So DI2I is a superset of I2I -- issuer == farIssuee satisfies it outright --
+            # and the delegation arm admits a delegated AID at any depth.
+            #
+            # Depth is not the operator's business. A delegator bounds how far its own
+            # delegation reaches with the DND config trait, which Kevery.validateDelegation
+            # honors at core/eventing.py:3287 by refusing any dip whose delegator carries
+            # it: to permit children but not grandchildren, put DND in the children.
+            # Reading DI2I as direct-only would instead forbid a two-layer hierarchy
+            # outright and force a second operator for every other depth.
+            #
+            # Resolved through .iseaid rather than .attrib['i'] so an aggregate ('A') far
+            # node works: .attrib is None there, so `'i' in creder.attrib` would raise
+            # TypeError. Deliberately not routed through the .reger.subjs lookup the I2I
+            # branch below uses either: subjs is an index of credentials this validator
+            # happens to have saved, so gating on it would make the edge's meaning depend
+            # on the local store rather than on the delegation.
+            farIssuee = creder.iseaid
+            if farIssuee is None:  # untargeted far node: no issuee to be a delegate of
+                return None
+
+            if issuer != farIssuee and not self._isDelegatedAID(issuer, farIssuee):
+                return None
+
+        elif op is not None and op != 'NI2I':
             # Resolve the far node's issuee via .iseaid so an aggregate ('acg') far
             # node (issuee at .sad["A"][1]["i"]) resolves identically to an
             # attributive one (.attrib["i"]). None means an untargeted far node,
-            # which cannot satisfy a targeted (I2I/DI2I) edge.
+            # which cannot satisfy a targeted (I2I) edge (#1529).
             farIssuee = creder.iseaid
             if farIssuee is None:
                 return None
@@ -491,3 +518,26 @@ class Verifier:
             return None
 
         return state
+
+    def _isDelegatedAID(self, pre, delpre):
+        """Returns True if pre is a delegated AID of delpre, at any depth.
+
+        The climb is keri.acdc.relating.delegationRefusal, shared with keri.acdc.edging
+        so that every edge evaluator on this branch answers DI2I the same way; its
+        docstring carries the reasoning (anchored seals rather than `delpre`, DND
+        re-checked, no depth bound). This branch's Verifier has no refusal/escrow split
+        (upstream #1681), so a pending answer and a refusal both read as False here and
+        escrow as the missing-chain retry processCredential already performs.
+
+        Parameters:
+            pre (str): qb64 AID whose delegation is in question, i.e. the issuer of the
+                near (edge-bearing) ACDC
+            delpre (str): qb64 AID that must be somewhere above it in the delegation
+                chain, i.e. the far node's issuee
+
+        Returns:
+            bool: True means every hop from pre up to delpre is a delegation its delegator
+                anchored and that DND permitted.
+
+        """
+        return relating.delegationRefusal(self.hby.kevers, self.hby.db, pre, delpre) == ""
