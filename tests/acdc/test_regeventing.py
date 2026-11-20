@@ -417,14 +417,13 @@ def herd(n=5):
     return [Diger(ser=b'herd event %d' % i).qb64 for i in range(n)]
 
 
-def anchorBatch(hab, *serders, typed=False, extra=()):
+def anchorBatch(hab, *serders, extra=()):
     """Anchor the given TEL events under ONE batch root seal in hab's KEL,
     mixed with herd leaves.  Returns (tree, proofs) where proofs maps each
     TEL event SAID to its inclusion proof."""
     leaves = sorted([serder.said for serder in serders] + herd() + list(extra))
     tree = BatchTree(leaves)
-    seal = (dict(t=BATCH_TREE_TYPE, d=tree.root) if typed
-            else dict(rd=tree.root))
+    seal = dict(t=BATCH_TREE_TYPE, d=tree.root)
     anchor(hab, data=[seal])
     return tree, {serder.said: tree.prove(serder.said) for serder in serders}
 
@@ -450,7 +449,7 @@ def test_V12_root_anchor_without_proof_refused_by_name():
 
 
 def test_V12a_batch_root_anchor_with_proofs_verifies():
-    """V12a: rip and bup committed under ONE Merkle-root seal {rd} in the
+    """V12a: rip and bup committed under ONE batch root seal {t, d} in the
     issuer's KEL, among herd leaves: with an inclusion proof per event the
     chain verifies, and each anchor couple names the root-sealing event."""
     with openIssuer("v12a") as (hby, hab):
@@ -508,23 +507,29 @@ def test_V12b_mixed_direct_and_root_anchors():
         assert rec.state == 'issued'
 
 
-def test_V12c_typed_batch_seal_verifies():
-    """V12c: the typed seal {t, d} whose type is the ACDC v2.0 batch tree is
-    a root seal too; a typed seal of any other type is not."""
-    with openIssuer("v12c") as (hby, hab):
-        ripper = makeRegistry(hab, anchored=False)
-        _, proofs = anchorBatch(hab, ripper, typed=True)
-        rootEvent = hab.kever.serder
-        rec = vet(rip=ripper, db=hby.db, proofs=proofs)
-        assert rec.anchors == ((rootEvent.sn, rootEvent.said),)
-
-    with openIssuer("v12c2") as (hby, hab):
-        ripper = makeRegistry(hab, anchored=False)
-        tree = BatchTree(sorted([ripper.said] + herd()))
-        anchor(hab, data=[dict(t='Xother-tree-type', d=tree.root)])
-        with pytest.raises(kering.MissingAnchorError):
-            vet(rip=ripper, db=hby.db,
-                proofs={ripper.said: tree.prove(ripper.said)})
+def test_V12c_only_the_batch_tree_type_is_a_root_seal():
+    """V12c: a root sealed under any seal other than the typed seal of type
+    BATCH_TREE_TYPE (YBMTRCAA) anchors nothing, even with a proof that
+    rebuilds it: not the untyped Merkle root seal {rd}, which declares no
+    construction; not a typed seal of another tree type (YCSMTCAA, the
+    spec's sparse-tree example); and not the ACDC v2 version tag an earlier
+    draft used as t (panel SPC-F1, SPC-F2)."""
+    for i, seal in enumerate(([("rd", None)], [("t", "YCSMTCAA")],
+                              [("t", "0OACDCCAACAA")])):
+        with openIssuer(f"v12c{i}") as (hby, hab):
+            ripper = makeRegistry(hab, anchored=False)
+            tree = BatchTree(sorted([ripper.said] + herd()))
+            key, t = seal[0]
+            data = (dict(rd=tree.root) if key == "rd"
+                    else dict(t=t, d=tree.root))
+            anchor(hab, data=[data])
+            with pytest.raises(kering.MissingAnchorError):
+                vet(rip=ripper, db=hby.db,
+                    proofs={ripper.said: tree.prove(ripper.said)})
+            # a source claim naming it, with no proof, is refused by name
+            with pytest.raises(kering.RootSealError):
+                vet(rip=ripper, db=hby.db,
+                    sources={ripper.said: hab.kever.sn})
 
 
 def test_V12d_bare_digest_of_root_is_not_a_root_seal():
@@ -586,7 +591,7 @@ def test_V12g_wrong_hint_at_root_event_does_not_refuse_direct_anchor():
         ripper = makeRegistry(hab)
         direct = hab.kever.serder
         tree = BatchTree(sorted(herd()))
-        anchor(hab, data=[dict(rd=tree.root)])
+        anchor(hab, data=[dict(t=BATCH_TREE_TYPE, d=tree.root)])
         rootEvent = hab.kever.serder
         rec = vet(rip=ripper, db=hby.db, sources={ripper.said: rootEvent.sn})
         assert rec.anchors == ((direct.sn, direct.said),)
@@ -602,7 +607,7 @@ def test_V12h_tree_hash_follows_root_digest_code():
         leaves = sorted([ripper.said] + herd())
         tree = BatchTree(leaves, code=DigDex.SHA3_256)
         assert Diger(qb64=tree.root).code == DigDex.SHA3_256
-        anchor(hab, data=[dict(rd=tree.root)])
+        anchor(hab, data=[dict(t=BATCH_TREE_TYPE, d=tree.root)])
         rootEvent = hab.kever.serder
         rec = vet(rip=ripper, db=hby.db,
                   proofs={ripper.said: tree.prove(ripper.said)})

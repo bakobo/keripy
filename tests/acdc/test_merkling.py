@@ -104,20 +104,36 @@ def test_leaf_must_be_a_qb64_digest():
         BatchTree([])
 
 
+def test_batch_tree_type_is_a_y_coded_seal_type():
+    """The KERI spec's typed seal t is a Tag7 'Y' primitive: a 4-character
+    seal type plus a 3-character version (spec-body.md, Typed seal; its
+    example is YCSMTCAA).  The dense batch tree's type is BMTR v2.0."""
+    from keri.core.coring import Verser, MtrDex
+    from keri.kering import Vrsn_2_0
+    assert BATCH_TREE_TYPE == "YBMTRCAA"
+    verser = Verser(qb64=BATCH_TREE_TYPE)
+    assert verser.code == MtrDex.Tag7
+    assert verser.versage.proto == "BMTR"
+    assert verser.versage.pvrsn == Vrsn_2_0
+
+
 def test_root_seals_recognized():
-    """A KEL event's seal list names a batch root either as the KERI Merkle
-    root seal {rd} or as a typed seal {t, d} whose type is the ACDC v2.0
-    batch tree.  A bare digest seal {d} or a bare string is NOT a root: it
-    commits to one datum, and reading it as a root would let any digest the
-    issuer ever sealed stand in for a tree it never built."""
-    r1, r2, r3, r4, r5 = saids(5, tag=b'root')
+    """Only a typed seal {t, d} whose t is BATCH_TREE_TYPE names a batch
+    root.  The untyped KERI Merkle root seal {rd} does not: it declares no
+    construction, and reading it as this dense tree would be a guess that a
+    sparse-tree issuer's verifier need not share.  A bare digest seal {d}, a
+    seal couple, a source seal or a bare string commits to one datum and is
+    not a root either.  A typed seal of the ACDC v2 version tag, which an
+    earlier draft used as t, is refused."""
+    r1, r2, r3, r4, r5, r6 = saids(6, tag=b'root')
     seals = [dict(rd=r1),
              dict(t=BATCH_TREE_TYPE, d=r2),
-             dict(t='other-type', d=r3),
+             dict(t='YCSMTCAA', d=r3),
+             dict(t='0OACDCCAACAA', d=r6),
              dict(d=r4),
              r5,
              dict(i='x', s='0', d=r4)]
-    assert rootSeals(seals) == [r1, r2]
+    assert rootSeals(seals) == [r2]
     assert rootSeals(None) == []
 
 

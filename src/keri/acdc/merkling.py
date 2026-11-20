@@ -31,10 +31,13 @@ independent-registry bulk-issuance examples:
 
 This is a plain (dense) Merkle tree.  The spec also describes a sparse Merkle
 tree; the two are different structures and a bare root digest cannot say
-which one it is.  An issuer can declare the type with a typed seal {t, d}
-whose t is BATCH_TREE_TYPE.  Be exact about what that declares: a Verser's
-value space is (proto, pvrsn, gvrsn), so t says "ACDC protocol v2.0", and the
-dense construction is pinned only as the one ACDC v2.0 defines.
+which one it is.  So the issuer declares it: a batch root is sealed only as
+a KERI typed seal {t, d} whose t is BATCH_TREE_TYPE, "YBMTRCAA", seal type
+BMTR (batch Merkle tree root) at version 2.0, in the Tag7 form the KERI spec
+gives typed seals (its own example is YCSMTCAA).  BMTR is coined here and is
+to be proposed for registration in kswg-acdc-specification#204.  The
+untyped KERI Merkle root seal {rd} is not read as a batch root, because it
+declares no construction and reading it as this one would be a guess.
 
 An inclusion proof is an ordered sequence of (sibling, side) pairs, leaf level
 first, where sibling is a qb64 digest and side is 'L' or 'R', the side on
@@ -44,7 +47,7 @@ contributes no pair.  No CESR wire encoding of a proof is defined here.
 
 from collections.abc import Mapping, Sequence
 
-from ..kering import MerkleProofError, Protocols, Vrsn_2_0
+from ..kering import MerkleProofError, Vrsn_2_0
 from ..core import Diger
 from ..core.coring import DigDex, Verser
 
@@ -52,9 +55,9 @@ from ..core.coring import DigDex, Verser
 LeafPrefix = b'\x00'  # RFC 6962 leaf domain prefix
 NodePrefix = b'\x01'  # RFC 6962 interior-node domain prefix
 
-BATCH_TREE_TYPE = Verser(proto=Protocols.acdc, pvrsn=Vrsn_2_0,
-                         gvrsn=Vrsn_2_0).qb64
-"""Type value t of a typed seal {t, d} whose d is a batch tree root."""
+BATCH_TREE_TYPE = Verser(proto="BMTR", pvrsn=Vrsn_2_0).qb64
+"""Type value t ("YBMTRCAA") of a typed seal {t, d} whose d is the root of
+this module's dense batch tree, version 2.0."""
 
 Sides = ('L', 'R')
 
@@ -221,13 +224,13 @@ def rootOf(said, proof, code=DigDex.Blake3_256):
 def rootSeals(seals):
     """Extract the batch tree roots a key event's seal list commits to.
 
-    A root is named by the KERI Merkle tree root digest seal {rd}, or by a
-    typed seal {t, d} whose t is BATCH_TREE_TYPE.  A bare digest seal {d},
-    a seal couple {s, d}, a source seal {i, s, d} and a bare string are not
-    roots: each commits to one datum, and reading one as a root would let a
-    digest the issuer sealed for another purpose stand in for a tree it never
-    built.  (With RFC 6962 domain separation no TEL event SAID can equal a
-    tree root, but the issuer's declaration is still what makes a root.)
+    A root is named only by a typed seal {t, d} whose t is BATCH_TREE_TYPE.
+    The untyped Merkle tree root digest seal {rd} declares no construction,
+    and a typed seal of another type declares a different one, so neither
+    is read as this tree.  A bare digest seal {d}, a seal couple {s, d}, a
+    source seal {i, s, d} and a bare string commit to one datum each, and
+    reading one as a root would let a digest the issuer sealed for another
+    purpose stand in for a tree it never built.
 
     Returns:
         roots (list[str]): qb64 root digests, in seal order
@@ -238,8 +241,6 @@ def rootSeals(seals):
     for seal in seals:
         if not isinstance(seal, Mapping):
             continue
-        if set(seal) == {'rd'}:
-            roots.append(seal['rd'])
-        elif set(seal) == {'t', 'd'} and seal['t'] == BATCH_TREE_TYPE:
+        if set(seal) == {'t', 'd'} and seal['t'] == BATCH_TREE_TYPE:
             roots.append(seal['d'])
     return roots

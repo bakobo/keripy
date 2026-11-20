@@ -326,6 +326,16 @@ def _rootDigests(serder):
     return rootSeals(serder.sad.get('a'))
 
 
+def _untypedRoots(serder):
+    """Digests of untyped Merkle root seals {rd}, which declare no tree
+    construction and so are never read as batch roots."""
+    seals = serder.sad.get('a') or ()
+    if not isinstance(seals, (list, tuple)):
+        return []
+    return [seal['rd'] for seal in seals
+            if isinstance(seal, Mapping) and set(seal) == {'rd'}]
+
+
 def _provesUnder(said, proof):
     """Predicate on a key event serder: some batch root it seals is the root
     proof rebuilds from said, hashing with that root's own digest code."""
@@ -454,7 +464,9 @@ def vetAnchor(serder, *, db, issuer, source=None, told=(), proof=None):
         eserder = _kelEvent(db, issuer, source)
         if eserder is not None:
             digs = sealDigests(eserder)
-            roots = _rootDigests(eserder)
+            # every aggregate-looking seal: batch roots, untyped Merkle
+            # roots {rd}, and digests of any other kind
+            roots = _rootDigests(eserder) + _untypedRoots(eserder)
             if serder.said in digs:
                 return (eserder.sn, eserder.said)
             if proves is not None and proves(eserder):

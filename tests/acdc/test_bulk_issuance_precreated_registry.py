@@ -111,7 +111,7 @@ import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from keri import Kinds, Ilks, Protocols
+from keri import Kinds, Ilks
 from keri.core import Salter, Noncer, Aggor, Mapper, Diger, Verfer, exchange
 from keri.core.coring import MtrDex, NonceDex, Verser
 from keri.core.eventing import incept
@@ -251,18 +251,15 @@ class _BulkNonces:
 # ===========================================================================
 # #204: an Issuer anchoring a batch of independent-registry transaction events SHOULD use
 # a TYPED seal rather than a bare Merkle-root-digest seal, so that a Validator reads a
-# declared type off the anchor instead of supplying an assumption. Be exact about how far
-# that reaches, because it is easy to overstate. KERI's typed seal carries a Verser, whose
-# entire value space is (proto, pvrsn, gvrsn) -- src/keri/core/coring.py:2487 -- so the
-# type it declares is "ACDC protocol v2.0" and NOT "dense rather than sparse". An Issuer
-# building the amalgamated sparse tree of spec L2918 under the same protocol version emits
-# a byte-identical `t`. The construction is pinned only transitively, by being the one
-# ACDC v2.0 defines, which #204 specifies and _BatchTree implements; committing it
-# directly would need a value space Verser does not have. What the typed seal buys over
-# the bare one is that an untyped anchor can be REFUSED rather than read as a dense-tree
-# root. The co-created sibling still uses the bare SealRoot, so the two spellings sit side
-# by side.
-# keri.acdc.merkling.BATCH_TREE_TYPE: Verser(proto=ACDC, pvrsn=2.0, gvrsn=2.0).
+# declared type off the anchor instead of supplying an assumption. The KERI spec gives a
+# typed seal's `t` as a Tag7 'Y' primitive, a 4-character seal type plus a 3-character
+# version (its own example is YCSMTCAA). The dense batch tree's type is
+# keri.acdc.merkling.BATCH_TREE_TYPE, "YBMTRCAA": seal type BMTR (batch Merkle tree
+# root), version 2.0, coined in keripy and to be proposed for registration in #204. An
+# earlier revision used the ACDC v2 message version tag as `t`, which is not a seal type
+# at all and could not tell a dense tree from a sparse one. A sparse-tree Issuer now
+# emits a different `t`, and an untyped anchor is REFUSED rather than read as a
+# dense-tree root. The co-created sibling uses the same typed seal.
 
 
 # The batch tree moved into the library, keri.acdc.merkling, unchanged; the
@@ -1012,7 +1009,7 @@ def test_precreg_pool_JSON():
     assert sealer.clan is SealKind                       # typed, not a bare root seal
     assert sealer.crew.t == BATCH_TREE_TYPE
     assert sealer.crew.d == tree.root
-    assert Verser(qb64=sealer.crew.t).versage.proto == Protocols.acdc
+    assert Verser(qb64=sealer.crew.t).versage.proto == "BMTR"   # the batch tree type
     for reg in batchRegs:
         assert _verify_anchored(reg.said, tree, sealer)
     # The seal names nothing, and one registry's proof discloses no other registry.
@@ -1774,13 +1771,9 @@ def test_precreg_disclosure_gating_and_revocation_JSON():
                             sealer=bulk.sealer) is None
     # ...and a BARE Merkle-root seal is refused rather than assumed. A Validator holding a
     # root digest alone cannot tell a dense batch tree from the amalgamated sparse tree
-    # spec L2918 describes, so #204 has the Issuer type the anchor. Note the limit of what
-    # the type can say: SealKind's `t` is a Verser, which encodes (proto, pvrsn, gvrsn) and
-    # nothing else (src/keri/core/coring.py:2487), so a sparse-tree Issuer under ACDC v2.0
-    # emits this exact `t`. The construction is pinned only transitively, by being the one
-    # ACDC v2.0 defines. What this assertion proves is the narrower and still worthwhile
-    # thing: an untyped anchor is refused, so a Validator never silently supplies a
-    # construction the Issuer never named.
+    # spec L2918 describes, so #204 has the Issuer type the anchor, and the type
+    # (YBMTRCAA) names the dense construction itself. An untyped anchor is refused, so a
+    # Validator never silently supplies a construction the Issuer never named.
     bareSealer = Sealer(crew=SealRoot(rd=bulk.tree.root))
     assert _verify_issuance(bulk.ageCopies[k], reg=pool.regs[i],
                             event=bulk.ageIssues[k], blind=bundle['blind'],
