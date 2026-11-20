@@ -378,6 +378,16 @@ def test_di2i_waits_on_a_delegation_not_yet_anchored():
     assert edging.DelegationPending(PAT, SUE) in verdict.causes
 
 
+def test_di2i_reads_only_the_empty_string_as_delegated():
+    """A check that answers with a bool rather than relating's strings must not
+    open the edge: False is falsy, like "", and once read as delegated."""
+    far = acdc(UTAH, issuee=SUE)
+    near = acdc(GUY, edge=edge(far, op="DI2I"))
+    for answer in (False, 0, b"", True):
+        verdict = verify(near, far, delegation=lambda pre, delpre: answer)
+        assert verdict.verdict == Verdicts.invalid, answer
+
+
 def test_di2i_refuses_an_untargeted_far_node():
     far = acdc(UTAH)
     near = acdc(SUE, edge=edge(far, op="DI2I"))

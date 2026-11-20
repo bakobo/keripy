@@ -433,7 +433,10 @@ class _Walker:
                                         f"{near.israid} needs", retryable=True,
                                         cause=DelegationPending(near.israid,
                                                                 far.iseaid))
-            if refusal:
+            # Only the empty string means delegated. Anything else, including a falsy
+            # False that a boolean check would return, is a refusal: read by truthiness,
+            # such a check would open the edge on exactly the answer meant to shut it.
+            if refusal != "":
                 return chaining.invalid(f"DI2I edge to node {said} requires the near "
                                         f"issuer {near.israid} to be the far issuee "
                                         f"{far.iseaid} or delegated from it; {refusal}")
