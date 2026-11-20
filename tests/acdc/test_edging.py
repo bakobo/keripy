@@ -380,7 +380,7 @@ def test_di2i_waits_on_a_delegation_not_yet_anchored():
 
 def test_di2i_reads_only_the_empty_string_as_delegated():
     """A check that answers with a bool rather than relating's strings must not
-    open the edge: False is falsy, like "", and once read as delegated."""
+    open the edge: False is falsy, like "", and was once read as delegated."""
     far = acdc(UTAH, issuee=SUE)
     near = acdc(GUY, edge=edge(far, op="DI2I"))
     for answer in (False, 0, b"", True):

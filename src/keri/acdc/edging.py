@@ -439,7 +439,7 @@ class _Walker:
             if refusal != "":
                 return chaining.invalid(f"DI2I edge to node {said} requires the near "
                                         f"issuer {near.israid} to be the far issuee "
-                                        f"{far.iseaid} or delegated from it; {refusal}")
+                                        f"{far.iseaid} or delegated from it; {refusal!r}")
         return chaining.valid(f"edge to node {said} satisfies its Operators")
 
     def pinned(self, resolved, *, far):
