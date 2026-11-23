@@ -869,13 +869,25 @@ class RootSealError(ValidationError):
     """
     Error the KEL event claimed to anchor a registry (TEL) event carries seal
     digest(s) that match no event in the presented TEL: an aggregate seal in
-    the style of a Merkle/SMT root over many transaction events. Verifying
-    such an anchor requires an inclusion proof, which is not supported, so
-    this is its own named refusal, distinct from an anchor that is merely
-    missing (MissingAnchorError).
+    the style of a Merkle root over many transaction events, and no
+    inclusion proof was presented for the event. Without a proof such an
+    anchor cannot be verified, so this is its own named refusal, distinct
+    from an anchor that is merely missing (MissingAnchorError).
 
     Usage:
         raise RootSealError("error message")
+    """
+
+
+class MerkleProofError(ValidationError):
+    """
+    Error a Merkle inclusion proof is malformed: its leaf is not a qb64
+    digest, or it is not a sequence of (qb64 digest, 'L'|'R') pairs. This is
+    permanent, unlike a well-formed proof whose root is not (yet) found
+    sealed in the issuer's KEL (MissingAnchorError).
+
+    Usage:
+        raise MerkleProofError("error message")
     """
 
 

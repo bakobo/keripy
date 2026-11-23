@@ -111,11 +111,12 @@ import pytest
 from jsonschema import Draft202012Validator
 from jsonschema.exceptions import ValidationError
 
-from keri import Kinds, Ilks, Protocols
+from keri import Kinds, Ilks
 from keri.core import Salter, Noncer, Aggor, Mapper, Diger, Verfer, exchange
 from keri.core.coring import MtrDex, NonceDex, Verser
 from keri.core.eventing import incept
 from keri.kering import Vrsn_2_0
+from keri.acdc.merkling import BatchTree, BATCH_TREE_TYPE
 from keri.acdc import regcept, blindate, acdcmap, acdcagg
 from keri.core.structing import Blinder, BlindState, Sealer, SealKind, SealRoot
 
@@ -250,92 +251,20 @@ class _BulkNonces:
 # ===========================================================================
 # #204: an Issuer anchoring a batch of independent-registry transaction events SHOULD use
 # a TYPED seal rather than a bare Merkle-root-digest seal, so that a Validator reads a
-# declared type off the anchor instead of supplying an assumption. Be exact about how far
-# that reaches, because it is easy to overstate. KERI's typed seal carries a Verser, whose
-# entire value space is (proto, pvrsn, gvrsn) -- src/keri/core/coring.py:2487 -- so the
-# type it declares is "ACDC protocol v2.0" and NOT "dense rather than sparse". An Issuer
-# building the amalgamated sparse tree of spec L2918 under the same protocol version emits
-# a byte-identical `t`. The construction is pinned only transitively, by being the one
-# ACDC v2.0 defines, which #204 specifies and _BatchTree implements; committing it
-# directly would need a value space Verser does not have. What the typed seal buys over
-# the bare one is that an untyped anchor can be REFUSED rather than read as a dense-tree
-# root. The co-created sibling still uses the bare SealRoot, so the two spellings sit side
-# by side.
-BATCH_TREE_TYPE = Verser(proto=Protocols.acdc, pvrsn=Vrsn_2_0, gvrsn=Vrsn_2_0).qb64
+# declared type off the anchor instead of supplying an assumption. The KERI spec gives a
+# typed seal's `t` as a Tag7 'Y' primitive, a 4-character seal type plus a 3-character
+# version (its own example is YCSMTCAA). The dense batch tree's type is
+# keri.acdc.merkling.BATCH_TREE_TYPE, "YBMTRCAA": seal type BMTR (batch Merkle tree
+# root), version 2.0, coined in keripy and to be proposed for registration in #204. An
+# earlier revision used the ACDC v2 message version tag as `t`, which is not a seal type
+# at all and could not tell a dense tree from a sparse one. A sparse-tree Issuer now
+# emits a different `t`, and an untyped anchor is REFUSED rather than read as a
+# dense-tree root. The co-created sibling uses the same typed seal.
 
 
-class _BatchTree:
-    """Merkle tree over TEL transaction-event SAIDs, anchored by ONE typed seal.
-
-    The Issuer periodically anchors a single seal in its KEL whose digest is this tree's
-    root, committing every transaction event from every registry touched since the last
-    anchor -- across all bulk-issued sets, all Issuees, and (here) all the unassigned
-    registries the round padded itself with (spec L2920-2926, #204). A Validator that
-    receives one event plus its inclusion proof learns that the Issuer committed to that
-    event and learns nothing about any other leaf.
-
-    Construction pinned by #204: a leaf is H(0x00 + leafSAID), an interior node is
-    H(0x01 + left + right), over qb64 TEXT concatenation with Blake3-256; RFC 6962 domain
-    separation is what stops an interior node's preimage from being replayed as a leaf.
-    An odd node at any level is PROMOTED unchanged rather than duplicated, which avoids
-    the duplicate-last-leaf ambiguity (CVE-2012-2459).
-
-    This is a plain (dense) Merkle tree. Spec L2918 also describes an amalgamated sparse
-    tree over every event of every registry; #204 records that the two are different
-    structures and that a bare root digest cannot distinguish them, which is the reason
-    for the typed seal above.
-    """
-
-    Leaf = b'\x00'      # RFC 6962 leaf domain prefix
-    Node = b'\x01'      # RFC 6962 interior-node domain prefix
-
-    def __init__(self, leaves):
-        if not leaves:
-            raise ValueError("a batch must commit at least one transaction event")
-        self.leaves = list(leaves)
-        self.levels = [[self._leaf(leaf) for leaf in self.leaves]]
-        while len(self.levels[-1]) > 1:
-            cur = self.levels[-1]
-            nxt = [self._node(cur[i], cur[i + 1]) for i in range(0, len(cur) - 1, 2)]
-            if len(cur) % 2:            # promote the odd node, never duplicate it
-                nxt.append(cur[-1])
-            self.levels.append(nxt)
-
-    @classmethod
-    def _leaf(cls, said):
-        return Diger(ser=cls.Leaf + said.encode()).qb64
-
-    @classmethod
-    def _node(cls, left, right):
-        return Diger(ser=cls.Node + (left + right).encode()).qb64
-
-    @property
-    def root(self):
-        """The batch root: the single value the Issuer seals in its KEL."""
-        return self.levels[-1][0]
-
-    def prove(self, said):
-        """Return the inclusion proof for event `said`: an ordered list of
-        (siblingDigest, side) pairs, leaf level first. `side` is which side the sibling
-        sits on. A promoted odd node contributes no sibling at that level."""
-        index = self.leaves.index(said)
-        proof = []
-        for level in self.levels[:-1]:
-            if index % 2:
-                proof.append((level[index - 1], 'L'))
-            elif index + 1 < len(level):
-                proof.append((level[index + 1], 'R'))
-            index //= 2
-        return proof
-
-    @classmethod
-    def verify(cls, said, proof, root):
-        """Recompute the root from the event SAID and its proof; True iff it matches."""
-        digest = cls._leaf(said)
-        for sibling, side in proof:
-            digest = (cls._node(sibling, digest) if side == 'L'
-                      else cls._node(digest, sibling))
-        return digest == root
+# The batch tree moved into the library, keri.acdc.merkling, unchanged; the
+# pinned roots below now pin the library construction.
+_BatchTree = BatchTree
 
 
 def _batch(*eventSaidGroups):
@@ -1080,7 +1009,7 @@ def test_precreg_pool_JSON():
     assert sealer.clan is SealKind                       # typed, not a bare root seal
     assert sealer.crew.t == BATCH_TREE_TYPE
     assert sealer.crew.d == tree.root
-    assert Verser(qb64=sealer.crew.t).versage.proto == Protocols.acdc
+    assert Verser(qb64=sealer.crew.t).versage.proto == "BMTR"   # the batch tree type
     for reg in batchRegs:
         assert _verify_anchored(reg.said, tree, sealer)
     # The seal names nothing, and one registry's proof discloses no other registry.
@@ -1842,13 +1771,9 @@ def test_precreg_disclosure_gating_and_revocation_JSON():
                             sealer=bulk.sealer) is None
     # ...and a BARE Merkle-root seal is refused rather than assumed. A Validator holding a
     # root digest alone cannot tell a dense batch tree from the amalgamated sparse tree
-    # spec L2918 describes, so #204 has the Issuer type the anchor. Note the limit of what
-    # the type can say: SealKind's `t` is a Verser, which encodes (proto, pvrsn, gvrsn) and
-    # nothing else (src/keri/core/coring.py:2487), so a sparse-tree Issuer under ACDC v2.0
-    # emits this exact `t`. The construction is pinned only transitively, by being the one
-    # ACDC v2.0 defines. What this assertion proves is the narrower and still worthwhile
-    # thing: an untyped anchor is refused, so a Validator never silently supplies a
-    # construction the Issuer never named.
+    # spec L2918 describes, so #204 has the Issuer type the anchor, and the type
+    # (YBMTRCAA) names the dense construction itself. An untyped anchor is refused, so a
+    # Validator never silently supplies a construction the Issuer never named.
     bareSealer = Sealer(crew=SealRoot(rd=bulk.tree.root))
     assert _verify_issuance(bulk.ageCopies[k], reg=pool.regs[i],
                             event=bulk.ageIssues[k], blind=bundle['blind'],

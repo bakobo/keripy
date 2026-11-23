@@ -133,7 +133,7 @@ constant, that is why -- re-derive them rather than assuming the text moved.
 A note on altitude. Like the sibling examples, this one models the credential graph,
 the bulk derivation, the registries, and the batch anchor at the data-structure level,
 built from the real v2 primitives in keri.core and keri.acdc.messaging (Salter.stretch,
-Noncer, Diger, Sealer/SealRoot, acdcmap/acdcagg, Aggor, Blinder, regcept, blindate,
+Noncer, Diger, Sealer/SealKind, acdcmap/acdcagg, Aggor, Blinder, regcept, blindate,
 exchange). It does not stand up a Habery/keystore, so the KEL that would carry the
 root seal is represented by the real Sealer object rather than by a real KEL. Every
 ACDC validates against a real, purpose-authored JSON Schema (Draft 2020-12). Actor
@@ -150,8 +150,9 @@ from keri import Kinds, Ilks
 from keri.core import Salter, Noncer, Aggor, Mapper, Diger, Verfer, exchange
 from keri.core.coring import MtrDex, NonceDex
 from keri.core.eventing import incept
+from keri.acdc.merkling import BatchTree, BATCH_TREE_TYPE
 from keri.acdc import regcept, blindate, acdcmap, acdcagg
-from keri.core.structing import Blinder, Sealer, SealRoot
+from keri.core.structing import Blinder, Sealer, SealKind
 
 
 # --- Reproducible example actors (see module docstring). ---
@@ -297,83 +298,9 @@ class _BulkNonces:
 # Phase 1b: the batch anchoring primitive (ACDC spec 15.4, "Independent Registry
 # Transaction Event Seals Using Merkle Tree Roots").
 # ===========================================================================
-class _BatchTree:
-    """Merkle tree over TEL transaction-event SAIDs, anchored by ONE root seal.
-
-    The Issuer periodically anchors a single seal in its KEL whose value is this tree's
-    root, committing every transaction event from every registry updated since the last
-    anchor -- across all bulk-issued sets and ALL Issuees (spec L2920-2922). A Validator
-    that receives one event plus its inclusion proof learns that the Issuer committed to
-    that event and learns nothing about any other leaf. The batch is the anonymity set:
-    the more registries and Issuees it mixes, the less a co-anchored pair of events says
-    about a common holder. Spec L2926 goes further and suggests the Issuer inject
-    state-preserving no-op updates to pad thin batches.
-
-    SPEC GAP / PINNED HERE. Spec L2922 describes the leaves as "all the event
-    SAIDs from all transaction events" and L2932 requires second-pre-image protection
-    of interior nodes, but pins
-    neither the domain separation nor the digest. This implementation uses RFC 6962
-    domain separation -- a leaf is H(0x00 + leafSAID), an interior node is
-    H(0x01 + left + right) -- over qb64 TEXT concatenation with Blake3-256, matching the
-    concatenation domain PR #200 pinned for the sibling variant's b_k. Domain separation
-    is what stops an interior node's preimage from being replayed as a leaf. An odd node
-    at any level is PROMOTED unchanged to the next level rather than duplicated, which
-    avoids the duplicate-last-leaf ambiguity (CVE-2012-2459). Two implementations that
-    chose differently would compute different roots.
-
-    This is a plain Merkle tree; see the module docstring on why not an SMT.
-    """
-
-    Leaf = b'\x00'      # RFC 6962 leaf domain prefix
-    Node = b'\x01'      # RFC 6962 interior-node domain prefix
-
-    def __init__(self, leaves):
-        if not leaves:
-            raise ValueError("a batch must commit at least one transaction event")
-        self.leaves = list(leaves)
-        self.levels = [[self._leaf(leaf) for leaf in self.leaves]]
-        while len(self.levels[-1]) > 1:
-            cur = self.levels[-1]
-            nxt = [self._node(cur[i], cur[i + 1]) for i in range(0, len(cur) - 1, 2)]
-            if len(cur) % 2:            # promote the odd node, never duplicate it
-                nxt.append(cur[-1])
-            self.levels.append(nxt)
-
-    @classmethod
-    def _leaf(cls, said):
-        return Diger(ser=cls.Leaf + said.encode()).qb64
-
-    @classmethod
-    def _node(cls, left, right):
-        return Diger(ser=cls.Node + (left + right).encode()).qb64
-
-    @property
-    def root(self):
-        """The batch root: the single value the Issuer seals in its KEL."""
-        return self.levels[-1][0]
-
-    def prove(self, said):
-        """Return the inclusion proof for event `said`: an ordered list of
-        (siblingDigest, side) pairs, leaf level first. `side` is which side the sibling
-        sits on. A promoted odd node contributes no sibling at that level."""
-        index = self.leaves.index(said)
-        proof = []
-        for level in self.levels[:-1]:
-            if index % 2:
-                proof.append((level[index - 1], 'L'))
-            elif index + 1 < len(level):
-                proof.append((level[index + 1], 'R'))
-            index //= 2
-        return proof
-
-    @classmethod
-    def verify(cls, said, proof, root):
-        """Recompute the root from the event SAID and its proof; True iff it matches."""
-        digest = cls._leaf(said)
-        for sibling, side in proof:
-            digest = (cls._node(sibling, digest) if side == 'L'
-                      else cls._node(digest, sibling))
-        return digest == root
+# The batch tree moved into the library, keri.acdc.merkling, unchanged; the
+# pinned roots below now pin the library construction.
+_BatchTree = BatchTree
 
 
 def _batch(*eventSaidGroups):
@@ -485,7 +412,7 @@ def test_cocreg_derivation_and_batch_JSON():
     assert not _BatchTree.verify(events[0], proof, Diger(ser=b'wrong-root').qb64)
 
     # A one-event batch is legal (its root is its leaf digest) and an empty one is not.
-    assert _BatchTree([events[0]]).root == _BatchTree._leaf(events[0])
+    assert _BatchTree([events[0]]).root == _BatchTree.leaf(events[0])
     with pytest.raises(ValueError):
         _BatchTree([])
 
@@ -775,21 +702,23 @@ def _herd_events(kind, nonces=None):
 def _anchor(*eventSaidGroups):
     """Anchor one batch: build the tree and return (tree, sealer).
 
-    The Sealer is the real KERI seal the Issuer would place in its KEL -- a SealRoot,
-    whose CESR count code is MerkleRootSealSingles ('-R'). ONE of these covers every
+    The Sealer is the real KERI seal the Issuer would place in its KEL -- a typed seal
+    {t, d} whose t is BATCH_TREE_TYPE ("YBMTRCAA", the dense batch tree, version 2.0),
+    so the anchor names its own construction. An earlier revision used the untyped
+    Merkle-root seal {rd}, which names none. ONE of these covers every
     registry in the batch, which is the whole point: M registry inceptions anchored
     side by side in a KEL event would let any third party reading that KEL reassemble
     the bulk-issued set, moving the correlator from the ACDC to the KEL rather than
     removing it.
     """
     tree = _BatchTree(_batch(*eventSaidGroups))
-    return tree, Sealer(crew=SealRoot(rd=tree.root))
+    return tree, Sealer(crew=SealKind(t=BATCH_TREE_TYPE, d=tree.root))
 
 
 def _verify_anchored(said, tree, sealer):
     """A Validator's check that the Issuer committed to transaction event `said`:
     the proof reconstructs the sealed root. Returns True or False."""
-    return _BatchTree.verify(said, tree.prove(said), sealer.crew.rd)
+    return _BatchTree.verify(said, tree.prove(said), sealer.crew.d)
 
 
 def test_cocreg_batch_anchor_JSON():
@@ -802,7 +731,7 @@ def test_cocreg_batch_anchor_JSON():
     about any other leaf -- not which other events exist, not whose they are, not that
     any two belong to one holder.
 
-    Asserted: the seal is a real SealRoot carrying the tree root; every one of Alice's
+    Asserted: the seal is a real typed batch-tree seal carrying the tree root; every one of Alice's
     events and every herd event proves under it; an event from a different batch does
     not; a proof discloses no other event SAID and the seal itself discloses no registry
     SAID; Alice's M registries are covered by exactly ONE anchor; and her leaves are
@@ -818,8 +747,8 @@ def test_cocreg_batch_anchor_JSON():
     tree, sealer = _anchor(aliceEvents, herdEvents)
 
     # The anchor is one real KERI Merkle-root seal over the whole batch.
-    assert sealer.clan is SealRoot
-    assert sealer.crew.rd == tree.root
+    assert sealer.clan is SealKind and sealer.crew.t == BATCH_TREE_TYPE
+    assert sealer.crew.d == tree.root
     assert len(tree.leaves) == BULK_SIZE + HERD_RESIDENTS * BULK_SIZE + DECOY_UPDATES
 
     # M independent registries; ONE anchoring seal covering all of them.
@@ -831,7 +760,7 @@ def test_cocreg_batch_anchor_JSON():
         assert _verify_anchored(said, tree, sealer)
     otherBatch = _BatchTree(_batch([Diger(ser=b'some other batch').qb64]))
     assert not _BatchTree.verify(otherBatch.leaves[0],
-                                 otherBatch.prove(otherBatch.leaves[0]), sealer.crew.rd)
+                                 otherBatch.prove(otherBatch.leaves[0]), sealer.crew.d)
 
     # The proof for Alice's copy-0 event discloses interior digests only: no other
     # event's SAID, and nothing that names a registry.
@@ -1401,7 +1330,7 @@ def _verify_issuance(copy, *, reg, event, blind, proof, sealer):
                               uuid=blind)
     if blinder is None:
         return None
-    if not _BatchTree.verify(event.said, proof, sealer.crew.rd):
+    if not _BatchTree.verify(event.said, proof, sealer.crew.d):
         return None
     return blinder.state
 
@@ -1486,7 +1415,7 @@ def test_cocreg_disclosure_gating_and_revocation_JSON():
     assert idIssues[k].said.encode() not in offer.raw           # TEL event withheld
     assert ageIssues[k].said.encode() not in offer.raw
     assert ageNonces.s(k).encode() not in offer.raw             # blinding salt withheld
-    assert sealer.crew.rd.encode() not in offer.raw             # batch root withheld
+    assert sealer.crew.d.encode() not in offer.raw             # batch root withheld
 
     # 3. agree (verifier -> holder): signed acceptance binding the offer.
     agree = exchange(sender=verifier, receiver=ALICES[k], route="/ipex/agree",
@@ -1512,7 +1441,7 @@ def test_cocreg_disclosure_gating_and_revocation_JSON():
                                           blind=Blinder.makeUUID(
                                               salt=ageNonces.s(k), sn=1),
                                           proof=tree.prove(ageIssues[k].said),
-                                          root=sealer.crew.rd)),
+                                          root=sealer.crew.d)),
                         stamp=GRANT_STAMP, kind=kind)
 
     # A forged signature unlocks nothing.
@@ -1662,7 +1591,7 @@ def test_cocreg_serialization_kinds(kind):
 
     # 2*M independent registries under exactly ONE anchoring seal, on every kind.
     assert len({r.said for r in idRegs} | {r.said for r in ageRegs}) == 2 * BULK_SIZE
-    assert sealer.crew.rd == tree.root
+    assert sealer.crew.d == tree.root
 
     # Partition across two contexts holds on every kind, registries and events included.
     presNonces = _BulkNonces(PRESENT_SALT)

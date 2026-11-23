@@ -47,6 +47,7 @@ from ..kering import (Ilks, ValidationError, ConfigurationError,
 from ..core import (Blinder, BlindState, BoundState, Diger, Number, Saider,
                     SerderACDC)
 from . import messaging
+from .merkling import BatchTree, rootOf, rootSeals
 
 logger = help.ogler.getLogger()
 
@@ -291,9 +292,13 @@ def sealDigests(serder):
     return digs
 
 
-def _scanKel(db, pre, said):
+def _scanKel(db, pre, said, *, match=None):
     """Scan the KEL of pre in db for a key event whose seals include a digest
     equal to said.
+
+    Parameters:
+        match (Callable|None): predicate on a key event serder replacing the
+            direct-seal test, e.g. "seals a batch root the proof rebuilds"
 
     Returns:
         couple (tuple|None): (sn, said) of the anchoring key event, or None
@@ -309,9 +314,35 @@ def _scanKel(db, pre, said):
         eserder = db.evts.get(keys=(pre, dig))
         if eserder is None:
             continue
-        if said in sealDigests(eserder):
+        if (match(eserder) if match is not None
+                else said in sealDigests(eserder)):
             return (sn, eserder.said)
     return None
+
+
+def _rootDigests(serder):
+    """The batch tree roots a key event's seals commit to (see
+    merkling.rootSeals)."""
+    return rootSeals(serder.sad.get('a'))
+
+
+def _untypedRoots(serder):
+    """Digests of untyped Merkle root seals {rd}, which declare no tree
+    construction and so are never read as batch roots."""
+    seals = serder.sad.get('a') or ()
+    if not isinstance(seals, (list, tuple)):
+        return []
+    return [seal['rd'] for seal in seals
+            if isinstance(seal, Mapping) and set(seal) == {'rd'}]
+
+
+def _provesUnder(said, proof):
+    """Predicate on a key event serder: some batch root it seals is the root
+    proof rebuilds from said, hashing with that root's own digest code."""
+    def match(eserder):
+        return any(BatchTree.verify(said, proof, root)
+                   for root in _rootDigests(eserder))
+    return match
 
 
 def _verifyAnchorCouple(serder, *, db, issuer, number, diger):
@@ -372,10 +403,12 @@ def _verifyAnchorCouple(serder, *, db, issuer, number, diger):
 
 
 # Verifier-side public API
-def vetAnchor(serder, *, db, issuer, source=None, told=()):
+def vetAnchor(serder, *, db, issuer, source=None, told=(), proof=None):
     """Verify that the registry (TEL) event serder is anchored in the
     issuer's KEL: some key event of the issuer carries a seal whose digest is
-    the TEL event's SAID.
+    the TEL event's SAID, or, given an inclusion proof, a batch tree root
+    seal (merkling.rootSeals) whose root the proof reconstructs from the TEL
+    event's SAID.  A direct seal is preferred when both exist.
 
     Returns:
         couple (tuple): (sn, said) of the anchoring key event in the
@@ -392,22 +425,36 @@ def vetAnchor(serder, *, db, issuer, source=None, told=()):
             lives in the issuer's KEL, by key event sequence number (int) or
             SAID (str).  A claim that resolves to an event whose seal
             digests match no event of the presented TEL (per told) is an
-            aggregate (Merkle/SMT root) seal and is refused by name.  A
-            claim that does not pan out otherwise falls back to a full scan,
-            since a wrong hint is indistinguishable from an anchor not yet
-            gathered.
+            aggregate (Merkle root) seal and, absent a proof, is refused by
+            name.  A claim that does not pan out otherwise falls back to a
+            full scan, since a wrong hint is indistinguishable from an
+            anchor not yet gathered.
         told (Iterable[str]): SAIDs of all events of the presented TEL, used
             only to discriminate an aggregate seal from a merely mistaken
             source claim.
+        proof (Sequence|None): optional inclusion proof of serder.said in a
+            batch tree, as (sibling, side) pairs (see merkling).  A proof
+            that reconstructs a root sealed nowhere establishes nothing,
+            retryably, like any missing anchor.
 
     Raises:
         MisanchorError: seal found, but only in a KEL whose controller is
             not the issuer (permanent refusal)
         RootSealError: the claimed anchoring event seals digests foreign to
-            the whole presented TEL (permanent refusal)
+            the whole presented TEL and no inclusion proof was presented
+            (permanent refusal)
+        MerkleProofError: the presented proof is malformed (permanent
+            refusal)
         MissingAnchorError: no seal found anywhere; the anchor may still be
             in flight (retryable)
     """
+    if proof is not None:
+        rootOf(serder.said, proof)  # refuse a malformed proof by name, first
+        proves = _provesUnder(serder.said, proof)
+    else:
+        proves = None
+    rootClaim = None
+
     if _kever(db, issuer) is None:
         raise MissingAnchorError(f"Issuer KEL for {issuer} not available to "
                                  f"verify the anchor of registry event "
@@ -417,27 +464,42 @@ def vetAnchor(serder, *, db, issuer, source=None, told=()):
         eserder = _kelEvent(db, issuer, source)
         if eserder is not None:
             digs = sealDigests(eserder)
+            # every aggregate-looking seal: batch roots, untyped Merkle
+            # roots {rd}, and digests of any other kind
+            roots = _rootDigests(eserder) + _untypedRoots(eserder)
             if serder.said in digs:
                 return (eserder.sn, eserder.said)
-            if digs and not set(digs) & set(told):
-                raise RootSealError(f"Claimed anchoring key event "
-                                    f"{eserder.said} at sn={eserder.sn} of "
-                                    f"issuer {issuer} seals digest(s) "
-                                    f"matching no event of the presented "
-                                    f"registry {list(told)[:1]}: an "
-                                    f"aggregate (Merkle/SMT root) seal "
-                                    f"requires an inclusion proof and is "
-                                    f"not supported.")
+            if proves is not None and proves(eserder):
+                return (eserder.sn, eserder.said)
+            if (proves is None and (digs or roots)
+                    and not set(digs) & set(told)):
+                rootClaim = eserder  # refused below unless a direct seal
         # a claim that did not pan out is just a bad hint: fall through
 
     couple = _scanKel(db, issuer, serder.said)
     if couple is not None:
         return couple
 
+    if proves is not None:
+        couple = _scanKel(db, issuer, None, match=proves)
+        if couple is not None:
+            return couple
+
+    if rootClaim is not None:
+        raise RootSealError(f"Claimed anchoring key event "
+                            f"{rootClaim.said} at sn={rootClaim.sn} of "
+                            f"issuer {issuer} seals digest(s) matching no "
+                            f"event of the presented registry "
+                            f"{list(told)[:1]}: an aggregate (Merkle root) "
+                            f"seal, and no inclusion proof was presented "
+                            f"for registry event {serder.said}.")
+
     for pre in list(db.kevers):
         if pre == issuer:
             continue
-        if _scanKel(db, pre, serder.said) is not None:
+        if (_scanKel(db, pre, serder.said) is not None
+                or (proves is not None and _scanKel(
+                    db, pre, None, match=proves) is not None)):
             raise MisanchorError(f"Seal for registry event {serder.said} "
                                  f"found in the KEL of {pre}, which is not "
                                  f"the registry issuer {issuer}: an "
@@ -558,7 +620,8 @@ def vetBindings(acdc, *, regid, issuer, td):
     return 'oneway'
 
 
-def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
+def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None,
+        proofs=None):
     """Verify a registry (TEL) event chain against the issuer's KEL and
     determine the registry's verified state.  This is the party-side
     verification core: it fetches nothing and concludes only from the
@@ -591,11 +654,16 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
         sources (Mapping|None): optional caller's claims of anchor
             locations, mapping TEL event said -> issuer KEL event sn (int)
             or said (str).  See vetAnchor.
+        proofs (Mapping|None): optional batch tree inclusion proofs,
+            mapping TEL event said -> proof, for events the issuer anchored
+            under one Merkle root seal rather than by their own seal.  See
+            vetAnchor and keri.acdc.merkling.
 
     Raises:
         MissequenceError, MisdigestError, MisregistryError,
-        MisanchorError, RootSealError, DuplicitousRegistryError,
-        MisbindingError, UnverifiedBlindError: permanent, named refusals
+        MisanchorError, RootSealError, MerkleProofError,
+        DuplicitousRegistryError, MisbindingError, UnverifiedBlindError:
+        permanent, named refusals
         MissingAnchorError: establishes nothing, retryably
     """
     ripper = vetRip(rip)
@@ -603,11 +671,13 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
     updates = [vetUpdate(update, ripper)
                for update in (updates if updates is not None else ())]
     sources = sources if sources is not None else {}
+    proofs = proofs if proofs is not None else {}
     told = [ripper.said] + [serder.said for serder in updates]
 
     chain = [ripper]
     anchors = [vetAnchor(ripper, db=db, issuer=issuer,
-                         source=sources.get(ripper.said), told=told)]
+                         source=sources.get(ripper.said), told=told,
+                         proof=proofs.get(ripper.said))]
 
     remaining = list(updates)
     prior = ripper
@@ -633,7 +703,8 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
         for serder in unique:  # every event must anchor before any concludes
             couples[serder.said] = vetAnchor(serder, db=db, issuer=issuer,
                                              source=sources.get(serder.said),
-                                             told=told)
+                                             told=told,
+                                             proof=proofs.get(serder.said))
         if len(unique) > 1:
             raise DuplicitousRegistryError(f"Registry duplicity for "
                                            f"{ripper.said}: {len(unique)} "
@@ -675,7 +746,7 @@ def vet(rip, updates=None, *, db, acdc=None, blinder=None, sources=None):
                           binding=binding, anchors=tuple(anchors))
 
 
-def vetRegistries(acdc, evidences, *, db, sources=None):
+def vetRegistries(acdc, evidences, *, db, sources=None, proofs=None):
     """Verify several registries' evidence against one presented ACDC and
     refuse parallel-registry equivocation: two registries by one issuer
     whose verified head states both commit to the ACDC but disagree are
@@ -692,6 +763,7 @@ def vetRegistries(acdc, evidences, *, db, sources=None):
             or (rip, updates, blinder) tuple as vet() takes them
         db (Baser): KEL database the caller has already populated
         sources (Mapping|None): optional anchor-location claims (see vet)
+        proofs (Mapping|None): optional batch tree inclusion proofs (see vet)
 
     Raises:
         ConflictingRegistriesError: two registries commit the ACDC with
@@ -709,7 +781,7 @@ def vetRegistries(acdc, evidences, *, db, sources=None):
             ripe, upds = evidence
             blinder = None
         records.append(vet(ripe, upds, db=db, blinder=blinder,
-                           sources=sources))
+                           sources=sources, proofs=proofs))
 
     committed = [record for record in records if record.acdc == serder.said]
     states = {record.state for record in committed}
@@ -730,7 +802,8 @@ def vetRegistries(acdc, evidences, *, db, sources=None):
 
 
 def vetBinds(rip, updates=None, *, db, blinders, target, controller=None,
-             acdc=None, sources=None, cutoff=None, requireSource=False):
+             acdc=None, sources=None, cutoff=None, requireSource=False,
+             proofs=None):
     """Verify a TEL and a disclosed non-vacuous target binding.
 
     Every blinded update from the verified head back through the latest
@@ -754,6 +827,8 @@ def vetBinds(rip, updates=None, *, db, blinders, target, controller=None,
             the verified TEL prefix.
         requireSource (bool): True requires an explicit source claim for the
             selected non-vacuous binding event.
+        proofs (Mapping | None): Optional batch tree inclusion proofs for
+            root-anchored TEL events (see vet).
 
     Returns:
         RegStateRecord: Verified TEL state resolved to the selected non-vacuous
@@ -791,7 +866,8 @@ def vetBinds(rip, updates=None, *, db, blinders, target, controller=None,
                 f"Invalid registry historical cutoff {cutoff}.") from ex
 
     # Verify the selected contiguous TEL prefix and all KEL anchors.
-    record = vet(rip=rip, updates=updates, db=db, sources=sources)
+    record = vet(rip=rip, updates=updates, db=db, sources=sources,
+                 proofs=proofs)
 
     blinders = list(blinders)
 
